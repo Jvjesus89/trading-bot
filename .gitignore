@@ -1,0 +1,51 @@
+# Environment Variables (SEGURANÇA - NUNCA SUBIR)
+.env
+.env*.local
+.env.development
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Logs e Telemetria local
+logs/
+*.log
+
+# Node.js & Next.js Frontend
+**/node_modules/
+**/.next/
+**/out/
+**/.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
+# IDEs e Sistema Operacional
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
