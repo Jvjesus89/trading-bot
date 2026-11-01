@@ -4,6 +4,7 @@ Emula a interface do ExchangeClient com dados reais da Binance (somente leitura)
 e execuções fictícias locais.
 """
 
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -13,6 +14,10 @@ import ccxt.async_support as ccxt
 from . import config
 
 logger = logging.getLogger(__name__)
+
+# Configuração de retry para chamadas de dados de mercado
+_OHLCV_MAX_RETRIES = 3
+_OHLCV_RETRY_DELAY = 2.0  # segundos (dobra a cada tentativa: 2s, 4s)
 
 
 class PaperTradingClient:
@@ -56,8 +61,34 @@ class PaperTradingClient:
     # Dados de mercado (passthrough para Binance real)
     # ------------------------------------------------------------------
 
-    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 250) -> list:
+    async def _fetch_ohlcv_raw(self, symbol: str, timeframe: str, limit: int) -> list:
+        """Chamada direta ao CCXT, sem retry."""
         return await self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 250) -> list:
+        """
+        Busca candles OHLCV com retry automático em caso de timeout.
+        Tenta até _OHLCV_MAX_RETRIES vezes com backoff exponencial.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, _OHLCV_MAX_RETRIES + 1):
+            try:
+                return await self._fetch_ohlcv_raw(symbol, timeframe, limit)
+            except (ccxt.RequestTimeout, ccxt.NetworkError) as exc:
+                last_exc = exc
+                if attempt < _OHLCV_MAX_RETRIES:
+                    wait = _OHLCV_RETRY_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        "[PAPER] fetch_ohlcv timeout (tentativa %d/%d). Retry em %.0fs: %s",
+                        attempt, _OHLCV_MAX_RETRIES, wait, exc,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        "[PAPER] fetch_ohlcv falhou após %d tentativas: %s",
+                        _OHLCV_MAX_RETRIES, exc,
+                    )
+        raise last_exc  # propaga após esgotar tentativas
 
     async def fetch_ticker(self, symbol: str) -> dict:
         return await self._exchange.fetch_ticker(symbol)
@@ -103,7 +134,7 @@ class PaperTradingClient:
         return (amount * price) >= config.trading.min_notional
 
     async def create_market_buy(self, symbol: str, amount: float) -> dict:
-        """Simula uma compra a mercado usando o preço bid do order book."""
+        """Simula uma compra a mercado usando o preço ask do ticker."""
         amount = self.amount_to_precision(symbol, amount)
         ticker = await self._exchange.fetch_ticker(symbol)
         price = ticker.get("ask", ticker.get("last", 0))
@@ -143,7 +174,7 @@ class PaperTradingClient:
         }
 
     async def create_market_sell(self, symbol: str, amount: float) -> dict:
-        """Simula uma venda a mercado usando o preço bid do order book."""
+        """Simula uma venda a mercado usando o preço bid do ticker."""
         amount = self.amount_to_precision(symbol, amount)
         ticker = await self._exchange.fetch_ticker(symbol)
         price = ticker.get("bid", ticker.get("last", 0))

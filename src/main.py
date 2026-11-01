@@ -49,6 +49,9 @@ class TradingEngine:
     Coordena todos os módulos em loops assíncronos independentes.
     """
 
+    # TTL do cache de candles 1h: 5 minutos (evita flood de DNS na Binance)
+    _1H_TTL: int = 300
+
     def __init__(self):
         # Seleciona cliente: Live ou Paper
         if config.is_live():
@@ -66,6 +69,10 @@ class TradingEngine:
         self._current_trade_id: str = ""
         self._running = True
         self._last_ia_was_authorized = False  # Para detectar mudanças de estado IA
+
+        # Cache de OHLCV 1h — renovado a cada 5 minutos, compartilhado entre Fast e Slow loops
+        self._cached_ohlcv_1h: list = []
+        self._last_ohlcv_1h_fetch: float = 0.0
 
     async def start(self) -> None:
         """Inicializa conexões e executa o motor."""
@@ -181,7 +188,21 @@ class TradingEngine:
             return
 
         # --- Busca dados de mercado ---
-        ohlcv_1h = await self.client.fetch_ohlcv(symbol, "1h", limit=250)
+        # Cache da EMA 1h: renovada a cada 5 min para evitar flood na API Binance
+        now = time.time()
+        if not self._cached_ohlcv_1h or (now - self._last_ohlcv_1h_fetch) > self._1H_TTL:
+            try:
+                ohlcv_1h = await self.client.fetch_ohlcv(symbol, "1h", limit=250)
+                self._cached_ohlcv_1h = ohlcv_1h
+                self._last_ohlcv_1h_fetch = now
+            except Exception as e:
+                if not self._cached_ohlcv_1h:
+                    logger.error("[FAST] Falha ao buscar OHLCV 1h e cache está vazio: %s", e)
+                    return
+                logger.warning("[FAST] Falha ao renovar OHLCV 1h — usando cache anterior: %s", e)
+        ohlcv_1h = self._cached_ohlcv_1h
+
+        # Candles 5m: leves, buscados a cada ciclo de 10s
         ohlcv_5m = await self.client.fetch_ohlcv(symbol, "5m", limit=50)
 
         # --- Calcula indicadores ---
@@ -444,10 +465,17 @@ class TradingEngine:
         # Funding rate — se disponível (apenas em futuros, usa 0 como default)
         funding_rate = 0.0  # Binance Spot não tem funding; pode ser estendido
 
-        # ATR de 1h
+        # ATR de 1h — reutiliza cache compartilhado com o Fast Loop
         symbol = config.trading.symbol
-        ohlcv_1h = await self.client.fetch_ohlcv(symbol, "1h", limit=250)
-        macro = calculate_macro_indicators(ohlcv_1h)
+        now = time.time()
+        if not self._cached_ohlcv_1h or (now - self._last_ohlcv_1h_fetch) > self._1H_TTL:
+            try:
+                ohlcv_1h = await self.client.fetch_ohlcv(symbol, "1h", limit=250)
+                self._cached_ohlcv_1h = ohlcv_1h
+                self._last_ohlcv_1h_fetch = now
+            except Exception as e:
+                logger.warning("[SLOW] Falha ao buscar OHLCV 1h — usando cache anterior: %s", e)
+        macro = calculate_macro_indicators(self._cached_ohlcv_1h) if self._cached_ohlcv_1h else None
         atr_1h = macro.atr_1h if macro else 0.0
 
         logger.info(

@@ -12,6 +12,10 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
+# Cooldown mínimo após qualquer STOP_LOSS individual (segundos).
+# Evita reentrada imediata no mesmo contexto de queda que causou o stop.
+_MIN_COOLDOWN_AFTER_STOP_S = 90  # 1 min 30s
+
 
 @dataclass
 class RiskState:
@@ -22,15 +26,16 @@ class RiskState:
     cooldown_ate: float = 0.0               # Timestamp até quando está em cooldown
     motivo_bloqueio: str = ""               # Motivo do bloqueio
     trades_hoje: int = 0                    # Contagem de trades no dia
-    ultimo_dia_utc: str = ""                # Dia UTC do último reset
+    ultimo_dia_utc: str = ""               # Dia UTC do último reset
 
 
 class RiskManager:
     """
     Implementa os circuit breakers:
     1. Drawdown Diário Máximo: -6% da banca → desliga até 00:00 UTC
-    2. Pausa Pós-Stop: 2 stops consecutivos → cooldown de 2h
-    3. Reset automático à meia-noite UTC
+    2. Pausa Pós-Stop Mínima: qualquer STOP_LOSS → cooldown de 90s
+    3. Pausa Pós-Stops Consecutivos: 2 stops seguidos → cooldown de 2h
+    4. Reset automático à meia-noite UTC
     """
 
     def __init__(self):
@@ -72,18 +77,22 @@ class RiskManager:
         if not self.state.operacional:
             return False, f"Circuit breaker ativo: {self.state.motivo_bloqueio}"
 
-        # 2. Cooldown pós-stops consecutivos
+        # 2. Cooldown (mínimo pós-stop individual OU pós-stops consecutivos)
         now = time.time()
         if now < self.state.cooldown_ate:
-            restante_min = (self.state.cooldown_ate - now) / 60
-            return False, f"Cooldown ativo: {restante_min:.0f}min restantes (2 stops consecutivos)"
+            restante_s = self.state.cooldown_ate - now
+            if restante_s > 120:
+                restante_str = f"{restante_s / 60:.0f}min"
+            else:
+                restante_str = f"{restante_s:.0f}s"
+            return False, f"Cooldown ativo: {restante_str} restantes"
 
         return True, "OK"
 
     def register_trade_result(self, pnl: float, motivo_saida: str) -> None:
         """
         Registra o resultado de um trade e atualiza os circuit breakers.
-        
+
         Args:
             pnl: Lucro/Prejuízo do trade em BRL (positivo = lucro).
             motivo_saida: STOP_LOSS, TAKE_PROFIT, BREAKEVEN, TRAILING.
@@ -119,16 +128,33 @@ class RiskManager:
             logger.critical("[RISCO] 🚨 %s", self.state.motivo_bloqueio)
             return
 
-        # Circuit Breaker 2: Cooldown pós-stops
-        if self.state.stops_consecutivos >= config.trading.cooldown_stops_consecutivos:
+        # Circuit Breaker 2: Cooldown pós-stops consecutivos (2h)
+        if (
+            motivo_saida == "STOP_LOSS"
+            and self.state.stops_consecutivos >= config.trading.cooldown_stops_consecutivos
+        ):
             cooldown_seconds = config.trading.cooldown_horas * 3600
             self.state.cooldown_ate = time.time() + cooldown_seconds
-            self.state.stops_consecutivos = 0  # Reset após ativar cooldown
+            self.state.stops_consecutivos = 0  # Reset após ativar cooldown longo
             logger.warning(
                 "[RISCO] ⏸️ Cooldown de %dh ativado após %d stops consecutivos",
                 config.trading.cooldown_horas,
                 config.trading.cooldown_stops_consecutivos,
             )
+            return
+
+        # Circuit Breaker 3: Cooldown mínimo pós-stop individual (90s)
+        # Aplicado sempre que há um STOP_LOSS, antes do contador consecutivo
+        # acionar o cooldown longo. Evita reentrada imediata no mesmo contexto.
+        if motivo_saida == "STOP_LOSS":
+            # Só aplica o cooldown curto se o longo ainda não estiver ativo
+            now = time.time()
+            if now >= self.state.cooldown_ate:
+                self.state.cooldown_ate = now + _MIN_COOLDOWN_AFTER_STOP_S
+                logger.info(
+                    "[RISCO] ⏱️ Cooldown mínimo de %ds ativado após STOP_LOSS",
+                    _MIN_COOLDOWN_AFTER_STOP_S,
+                )
 
     def get_status_summary(self) -> dict:
         """Retorna resumo do estado de risco para logs/notificações."""

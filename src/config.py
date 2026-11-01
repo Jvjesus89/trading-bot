@@ -70,7 +70,7 @@ class ExchangeConfig:
 class GeminiConfig:
     """Configurações da integração com Gemini Flash."""
     api_key: str = os.getenv("GEMINI_API_KEY", "")
-    model: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 @dataclass(frozen=True)
