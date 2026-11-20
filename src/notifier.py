@@ -127,13 +127,35 @@ class Notifier:
         logger.warning("[NOTIFY] %s", msg.replace("<b>", "").replace("</b>", ""))
         await self._send_telegram(msg)
 
-    async def notify_ia_unlock(self, motivo: str) -> None:
-        """✅ IA desbloqueou operações."""
-        msg = (
-            f"✅ <b>[IA UNLOCK]</b> Operações autorizadas.\n"
-            f"Motivo: {motivo}"
-        )
-        logger.info("[NOTIFY] %s", msg.replace("<b>", "").replace("</b>", ""))
+    async def notify_ia_unlock(self, motivo: str, fonte: str = "deepseek") -> None:
+        """
+        ✅ IA autorizou a entrada.
+
+        `fonte` distingue aprovação real do DeepSeek ("deepseek") de:
+        - "disabled": validação desativada por configuração
+        - "missing_key": chave da API ausente
+        - "error"/"fail_safe": falha do modelo (entrada bloqueada)
+        """
+        if fonte == "deepseek":
+            msg = (
+                f"✅ <b>[IA UNLOCK]</b> Entrada autorizada pelo DeepSeek.\n"
+                f"Motivo: {motivo}"
+            )
+            logger.info("[NOTIFY] %s", msg.replace("<b>", "").replace("</b>", ""))
+        elif fonte in ("disabled", "missing_key"):
+            msg = (
+                f"🔄 <b>[IA OFF]</b> Auditoria indisponível — "
+                f"entrada liberada sem modelo.\n"
+                f"Motivo: {motivo}"
+            )
+            logger.info("[NOTIFY] %s", msg.replace("<b>", "").replace("</b>", ""))
+        else:
+            msg = (
+                f"⚠️ <b>[IA FALLBACK]</b> DeepSeek indisponível — "
+                f"entrada bloqueada por segurança.\n"
+                f"Motivo: {motivo}"
+            )
+            logger.warning("[NOTIFY] %s", msg.replace("<b>", "").replace("</b>", ""))
         await self._send_telegram(msg)
 
     async def notify_circuit_breaker(self, motivo: str, pnl_diario: float) -> None:

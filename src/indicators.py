@@ -22,29 +22,91 @@ class MacroIndicators:
     price_above_ema: bool         # Preço de fechamento > EMA 200
     current_close: float          # Preço de fechamento do último candle 1h
     atr_1h: float                 # ATR 14 do 1h (para payload da IA)
-    atr_1h_mediana: float = 0.0   # Mediana do ATR 1h (últimas 100h) — referência de "normal"
+    atr_1h_mediana: float = 0.0   # Mediana do ATR 1h (últimas 100h) — volatilidade "normal"
 
 
 @dataclass
 class ExecutionIndicators:
-    """Indicadores do gráfico de 5m (referentes ao último candle FECHADO por padrão)."""
+    """Indicadores do gráfico de 5m."""
     bb_upper: float               # Banda Superior de Bollinger
-    bb_middle: float              # Banda Média (SMA 20) — alvo da reversão à média
+    bb_middle: float              # Banda Média (SMA 20)
     bb_lower: float               # Banda Inferior de Bollinger
     rsi: float                    # RSI (14)
     atr: float                    # ATR (14)
     rvol: float                   # Volume Relativo (Volume / SMA Volume 20)
-    current_close: float          # Preço de fechamento do candle de referência
-    current_volume: float         # Volume do candle de referência
+    current_close: float          # Preço de fechamento do último candle 5m
+    current_open: float           # Preço de abertura do último candle 5m
+    current_high: float           # Máxima do último candle 5m
+    current_low: float            # Mínima do último candle 5m
+    current_volume: float         # Volume do último candle 5m
     candle_ts: int = 0            # Timestamp (ms) do candle de referência
-    # Sinais (se EXIGIR_REVERSAO=true, BB/RSI/RVOL se referem ao candle de setup,
-    # que é o anterior ao candle de reversão)
-    price_at_or_below_bb_lower: bool = False
-    rsi_oversold: bool = False
-    volume_confirmed: bool = False
-    reversao_confirmada: bool = True
-    alvo_cobre_custo: bool = True
-    distancia_alvo_pct: float = 0.0
+    # Com EXIGIR_REVERSAO=true, os sinais de banda/RSI/RVOL vêm do candle ANTERIOR
+    # (setup) e o candle atual precisa ser o de reversão. None = usa o próprio candle.
+    setup_bb: Optional[bool] = None
+    setup_rsi: Optional[bool] = None
+    setup_rvol: Optional[bool] = None
+    distancia_alvo_pct: float = 0.0   # Distância até o alvo, em % do preço
+    alvo_cobre_custo: bool = True     # Alvo paga custos (MIN_ALVO_MULT_CUSTO) e risco (MIN_RR)
+
+    @property
+    def is_green_candle(self) -> bool:
+        """Indica se o candle atual é de alta (compradores dominando o candle)."""
+        return self.current_close > self.current_open
+
+    @property
+    def price_at_or_below_bb_lower(self) -> bool:
+        """Preço de fechamento tocou ou rompeu a Banda Inferior."""
+        return self.current_close <= self.bb_lower
+
+    @property
+    def price_tested_bb_lower(self) -> bool:
+        """Toque na Banda Inferior (pela mínima ou pelo fechamento, conforme TOQUE_PELA_MINIMA)."""
+        if self.setup_bb is not None:
+            return self.setup_bb
+        return toque_banda(self.current_low, self.current_close, self.bb_lower)
+
+    @property
+    def rsi_oversold(self) -> bool:
+        """RSI abaixo do limiar de sobrevenda (configurável, default 32)."""
+        if self.setup_rsi is not None:
+            return self.setup_rsi
+        return self.rsi < config.trading.rsi_threshold
+
+    @property
+    def volume_confirmed(self) -> bool:
+        """Volume relativo acima do limiar (configurável, default 1.0)."""
+        if self.setup_rvol is not None:
+            return self.setup_rvol
+        return self.rvol > config.trading.rvol_threshold
+
+    @property
+    def reversao_confirmada(self) -> bool:
+        """Candle de reversão: fechou verde e de volta acima da banda inferior."""
+        return self.is_green_candle and self.current_close > self.bb_lower
+
+
+def toque_banda(low: float, close: float, bb_lower: float) -> bool:
+    """Regra de toque na Banda Inferior (compartilhada pelo bot e pelo backtest)."""
+    if config.trading.toque_pela_minima:
+        return low <= bb_lower or close <= bb_lower * 1.002
+    return close <= bb_lower
+
+
+def avaliar_alvo(close: float, atr: float, bb_middle: float) -> tuple[float, bool]:
+    """
+    Distância até o alvo (fração do preço) e se ela compensa custos e risco.
+    Mesmas regras que Strategy.open_position usa para montar SL/TP.
+    """
+    cfg = config.trading
+    if close <= 0 or not np.isfinite(atr):
+        return 0.0, False
+    dist_stop = max(cfg.sl_atr_mult * atr / close, cfg.sl_min_pct)
+    if cfg.alvo_na_media:
+        dist_alvo = (bb_middle - close) / close if np.isfinite(bb_middle) else 0.0
+    else:
+        dist_alvo = max(cfg.tp_atr_mult * atr / close, cfg.tp_min_pct)
+    ok = dist_alvo >= cfg.min_alvo_mult_custo * cfg.custo_ida_volta and dist_alvo >= cfg.min_rr * dist_stop
+    return dist_alvo, bool(ok)
 
 
 def _to_dataframe(ohlcv: list) -> pd.DataFrame:
@@ -116,52 +178,6 @@ def compute_rvol(volume: pd.Series, period: int) -> pd.Series:
     return volume / vol_sma.replace(0, np.nan)
 
 
-def compute_signal_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calcula todos os indicadores e sinais do 5m de forma vetorizada.
-    Usado tanto pelo bot ao vivo quanto pelo backtest (mesma lógica nos dois).
-    """
-    cfg = config.trading
-    close, open_, volume = df["close"], df["open"], df["volume"]
-
-    bb_upper, bb_middle, bb_lower = compute_bollinger_bands(close, cfg.bb_period, cfg.bb_std)
-    rsi = compute_rsi(close, cfg.rsi_period)
-    atr = compute_atr(df, cfg.atr_period)
-    rvol = compute_rvol(volume, cfg.rvol_period).fillna(0.0)
-
-    touch = close <= bb_lower
-    rsi_ok = rsi < cfg.rsi_threshold
-    rvol_ok = rvol > cfg.rvol_threshold
-
-    if cfg.exigir_reversao:
-        # Setup no candle anterior, confirmação no candle atual
-        touch = touch.shift(1).fillna(False).astype(bool)
-        rsi_ok = rsi_ok.shift(1).fillna(False).astype(bool)
-        rvol_ok = rvol_ok.shift(1).fillna(False).astype(bool)
-        reversao = (close > open_) & (close > bb_lower)
-    else:
-        reversao = pd.Series(True, index=df.index)
-
-    # Distância até o alvo e até o stop, em % do preço
-    if cfg.alvo_na_media:
-        dist_alvo = (bb_middle - close) / close
-    else:
-        dist_alvo = cfg.tp_atr_mult * atr / close
-    dist_stop = cfg.sl_atr_mult * atr / close
-    alvo_ok = (dist_alvo >= cfg.min_alvo_mult_custo * cfg.custo_ida_volta) & (
-        dist_alvo >= cfg.min_rr * dist_stop
-    )
-
-    return pd.DataFrame({
-        "open": open_, "high": df["high"], "low": df["low"], "close": close, "volume": volume,
-        "bb_upper": bb_upper, "bb_middle": bb_middle, "bb_lower": bb_lower,
-        "rsi": rsi, "atr": atr, "rvol": rvol,
-        "bb_touch": touch, "rsi_ok": rsi_ok, "rvol_ok": rvol_ok,
-        "reversao": reversao.astype(bool), "alvo_ok": alvo_ok.fillna(False).astype(bool),
-        "dist_alvo": dist_alvo,
-    }, index=df.index)
-
-
 def calculate_macro_indicators(ohlcv_1h: list) -> Optional[MacroIndicators]:
     """
     Calcula indicadores do gráfico de 1h.
@@ -207,33 +223,65 @@ def calculate_execution_indicators(ohlcv_5m: list) -> Optional[ExecutionIndicato
 
     df = _to_dataframe(ohlcv_5m)
 
-    # O último candle retornado pela Binance ainda está em formação: RSI, banda e
-    # volume dele mudam a cada segundo ("repintam"). Por padrão usamos só candles fechados.
+    # O último candle da Binance ainda está em formação e "repinta".
     if config.trading.sinal_candle_fechado:
         df = df.iloc[:-1]
         if len(df) < min_required:
             return None
 
-    f = compute_signal_frame(df)
-    last = f.iloc[-1]
+    series = compute_series_5m(df)
+    return build_execution(series, len(df) - 1)
 
-    def _num(v, default=0.0):
-        return default if pd.isna(v) else float(v)
+
+def compute_series_5m(df: pd.DataFrame) -> dict:
+    """Calcula todas as séries do 5m de uma vez (usado pelo bot e pelo backtest)."""
+    cfg = config.trading
+    close = df["close"]
+    bb_upper, bb_middle, bb_lower = compute_bollinger_bands(close, cfg.bb_period, cfg.bb_std)
+    return {
+        "ts": (df.index.asi8 // 1_000_000).astype(np.int64),
+        "open": df["open"].to_numpy(float),
+        "high": df["high"].to_numpy(float),
+        "low": df["low"].to_numpy(float),
+        "close": close.to_numpy(float),
+        "volume": df["volume"].to_numpy(float),
+        "bb_upper": bb_upper.to_numpy(float),
+        "bb_middle": bb_middle.to_numpy(float),
+        "bb_lower": bb_lower.to_numpy(float),
+        "rsi": compute_rsi(close, cfg.rsi_period).fillna(50.0).to_numpy(float),
+        "atr": compute_atr(df, cfg.atr_period).to_numpy(float),
+        "rvol": compute_rvol(df["volume"], cfg.rvol_period).fillna(0.0).to_numpy(float),
+    }
+
+
+def build_execution(s: dict, i: int) -> ExecutionIndicators:
+    """Monta os indicadores de execução do candle i (mesma regra ao vivo e no backtest)."""
+    cfg = config.trading
+    setup_bb = setup_rsi = setup_rvol = None
+    if cfg.exigir_reversao and i >= 1:
+        j = i - 1
+        setup_bb = toque_banda(s["low"][j], s["close"][j], s["bb_lower"][j])
+        setup_rsi = bool(s["rsi"][j] < cfg.rsi_threshold)
+        setup_rvol = bool(s["rvol"][j] > cfg.rvol_threshold)
+
+    dist_alvo, alvo_ok = avaliar_alvo(s["close"][i], s["atr"][i], s["bb_middle"][i])
 
     return ExecutionIndicators(
-        bb_upper=_num(last["bb_upper"]),
-        bb_middle=_num(last["bb_middle"]),
-        bb_lower=_num(last["bb_lower"]),
-        rsi=_num(last["rsi"], 50.0),
-        atr=_num(last["atr"]),
-        rvol=_num(last["rvol"]),
-        current_close=float(last["close"]),
-        current_volume=float(last["volume"]),
-        candle_ts=int(df.index[-1].value // 1_000_000),
-        price_at_or_below_bb_lower=bool(last["bb_touch"]),
-        rsi_oversold=bool(last["rsi_ok"]),
-        volume_confirmed=bool(last["rvol_ok"]),
-        reversao_confirmada=bool(last["reversao"]),
-        alvo_cobre_custo=bool(last["alvo_ok"]),
-        distancia_alvo_pct=_num(last["dist_alvo"]) * 100.0,
+        bb_upper=float(s["bb_upper"][i]),
+        bb_middle=float(s["bb_middle"][i]),
+        bb_lower=float(s["bb_lower"][i]),
+        rsi=float(s["rsi"][i]),
+        atr=float(s["atr"][i]),
+        rvol=float(s["rvol"][i]),
+        current_close=float(s["close"][i]),
+        current_open=float(s["open"][i]),
+        current_high=float(s["high"][i]),
+        current_low=float(s["low"][i]),
+        current_volume=float(s["volume"][i]),
+        candle_ts=int(s["ts"][i]),
+        setup_bb=setup_bb,
+        setup_rsi=setup_rsi,
+        setup_rvol=setup_rvol,
+        distancia_alvo_pct=dist_alvo * 100.0,
+        alvo_cobre_custo=alvo_ok,
     )

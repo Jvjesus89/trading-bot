@@ -2,8 +2,8 @@
 Motor Quantitativo de Alta Performance — Entry Point e Orquestrador.
 
 Arquitetura Dual-Speed:
-  • Fast Loop (10s): Monitoramento, indicadores, gestão de stops
-  • Slow Loop (30min): Consulta Gemini Flash para contexto macro
+  • Fast Loop (10s): indicadores, setup técnico, auditoria DeepSeek e stops
+  • Slow Loop (30min): aquece o contexto macro (BTC 4h) usado pela auditoria
   • Heartbeat (5min): Ping de saúde para monitoramento externo
 """
 
@@ -22,10 +22,11 @@ from .paper_trading import PaperTradingClient
 from .indicators import calculate_macro_indicators, calculate_execution_indicators
 from .strategy import Strategy, ExitReason
 from .risk_manager import RiskManager
-from .ai_advisor import AIAdvisor
+from .ai_advisor import AIAdvisor, regras_macro
 from .persistence import PersistenceManager
 from .state_manager import StateManager
 from .notifier import Notifier
+from .funding import close_funding_exchange
 
 # Configura logging
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
@@ -41,6 +42,12 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("main")
+
+# O httpx registra a URL completa de cada requisição em nível INFO. Como URLs
+# podem carregar credenciais (ex.: ?key=...), mantemos o client HTTP em WARNING
+# para não gravar segredos no bot.log nem no log do Docker.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 class TradingEngine:
@@ -68,8 +75,11 @@ class TradingEngine:
 
         self._current_trade_id: str = ""
         self._running = True
-        self._last_ia_was_authorized = False  # Para detectar mudanças de estado IA
-        self._last_entry_candle_ts: int = 0   # Evita 2 entradas no mesmo sinal/candle
+        # Contexto macro (BTC 4h) compartilhado: o Slow Loop aquece e o Fast
+        # Loop consome na auditoria de entrada, sem bater na Binance a cada 10s.
+        self._btc_variation_4h: float = 0.0
+        self._btc_variation_fetched_at: float = 0.0
+        self._last_entry_candle_ts: int = 0   # Um sinal (candle) = no máximo uma entrada
 
         # Cache de OHLCV 1h — renovado a cada 5 minutos, compartilhado entre Fast e Slow loops
         self._cached_ohlcv_1h: list = []
@@ -138,6 +148,10 @@ class TradingEngine:
             await self.client.close()
         except Exception as e:
             logger.error("Erro ao fechar exchange: %s", e)
+        try:
+            await close_funding_exchange()
+        except Exception as e:
+            logger.error("Erro ao fechar cliente de futuros: %s", e)
         logger.info("Motor encerrado.")
 
     # ==================================================================
@@ -157,12 +171,8 @@ class TradingEngine:
         symbol = config.trading.symbol
         interval = config.trading.fast_loop_interval
 
-        # Espera a primeira consulta da IA (ou timeout de 60s)
-        logger.info("[FAST] Aguardando primeira consulta da IA...")
-        start_wait = time.time()
-        while not self.ai_advisor.last_verdict.timestamp and (time.time() - start_wait) < 60:
-            await asyncio.sleep(1)
-
+        # A auditoria de IA agora é por entrada (não há slow loop de IA para
+        # aguardar): o primeiro setup técnico dispara a primeira consulta.
         logger.info("[FAST] Iniciando Fast Loop (intervalo: %ds)", interval)
 
         while self._running:
@@ -204,7 +214,7 @@ class TradingEngine:
         ohlcv_1h = self._cached_ohlcv_1h
 
         # Candles 5m: leves, buscados a cada ciclo de 10s
-        # 150 candles: dá aquecimento suficiente para o RSI/ATR exponenciais
+        # 150 candles: aquecimento suficiente para RSI/ATR exponenciais
         ohlcv_5m = await self.client.fetch_ohlcv(symbol, "5m", limit=150)
 
         # --- Calcula indicadores ---
@@ -221,7 +231,7 @@ class TradingEngine:
         # --- Se posicionado: gerencia saída ---
         if self.strategy.is_positioned:
             ticker = await self.client.fetch_ticker(symbol)
-            # Venda a mercado executa no BID — é ele que decide se o stop foi atingido
+            # A venda a mercado executa no BID — é ele que decide se o stop foi atingido
             current_price = ticker.get("bid") or ticker.get("last") or execution.current_close
             exit_reason = self.strategy.check_exit(current_price)
 
@@ -229,16 +239,77 @@ class TradingEngine:
                 await self._execute_exit(symbol, current_price, exit_reason)
             return
 
-        # --- Se não posicionado: avalia entrada ---
-        ia_authorized = self.ai_advisor.is_authorized
-
-        # Um sinal (candle) = no máximo uma entrada
+        # --- Se não posicionado: setup técnico + regras macro + auditoria IA ---
         if execution.candle_ts and execution.candle_ts == self._last_entry_candle_ts:
+            return  # já entramos neste sinal
+
+        if not self.strategy.technical_setup(macro, execution):
             return
 
-        if self.strategy.evaluate_entry(macro, execution, ia_authorized):
-            self._last_entry_candle_ts = execution.candle_ts
-            await self._execute_entry(symbol, execution)
+        btc_trend = await self._get_btc_variation_4h()
+
+        # Filtro macro determinístico (queda do BTC / choque de volatilidade):
+        # barato e sem depender de API — roda antes do DeepSeek.
+        if config.trading.filtro_macro_regras:
+            macro_ok, macro_motivo = regras_macro(
+                btc_trend, macro.atr_1h, macro.atr_1h_mediana
+            )
+            if not macro_ok:
+                logger.warning("[FAST] Entrada VETADA pelas regras macro: %s", macro_motivo)
+                return
+        verdict = await self.ai_advisor.audit_entry(
+            symbol=symbol,
+            current_price=execution.current_close,
+            rsi=execution.rsi,
+            rvol=execution.rvol,
+            btc_trend=btc_trend,
+        )
+
+        if not verdict.autorizado:
+            logger.warning(
+                "[FAST] Entrada VETADA pela auditoria (%s): %s | "
+                "RSI=%.1f RVOL=%.2f BTC4h=%+.2f%%",
+                verdict.fonte, verdict.motivo,
+                execution.rsi, execution.rvol, btc_trend,
+            )
+            return
+
+        # A auditoria pode levar alguns segundos; revalida o circuit breaker
+        # antes de enviar a ordem.
+        can_trade, cb_reason = self.risk_manager.can_trade()
+        if not can_trade:
+            logger.warning(
+                "[FAST] Entrada cancelada após auditoria — risco ativo: %s",
+                cb_reason,
+            )
+            return
+
+        self._last_entry_candle_ts = execution.candle_ts
+        await self._execute_entry(symbol, execution, verdict)
+
+    async def _get_btc_variation_4h(self, max_age: float = 300.0) -> float:
+        """
+        Retorna a variação do BTC em 4h, renovando o cache se estiver velho.
+
+        É a única métrica macro que a auditoria de entrada precisa. O cache de
+        5 min evita uma chamada extra à Binance a cada ciclo de 10s quando um
+        setup fica verde por vários minutos.
+        """
+        now = time.time()
+        if (
+            not self._btc_variation_fetched_at
+            or (now - self._btc_variation_fetched_at) > max_age
+        ):
+            try:
+                self._btc_variation_4h = await self.client.fetch_btc_variation_4h()
+                self._btc_variation_fetched_at = now
+            except Exception as e:
+                logger.warning(
+                    "[CONTEXT] Falha ao atualizar BTC 4h — usando último valor "
+                    "(%.2f%%): %s",
+                    self._btc_variation_4h, e,
+                )
+        return self._btc_variation_4h
 
     async def _monitor_position(self, symbol: str) -> None:
         """Monitora stops mesmo quando circuit breaker está ativo."""
@@ -277,6 +348,12 @@ class TradingEngine:
                 }
 
             can_trade, reason = self.risk_manager.can_trade()
+
+            # Mesmas regras da estratégia (sem duplicar lógica aqui)
+            conds = self.strategy._check_conditions(
+                macro, execution, self.ai_advisor.is_authorized, log=False
+            )
+
             state_data = {
                 "timestamp": time.time(),
                 "symbol": config.trading.symbol,
@@ -304,12 +381,11 @@ class TradingEngine:
                     "ema_200": round(macro.ema_200, 4) if macro else None,
                 },
                 "signals": {
-                    "ema200_trend": macro.price_above_ema if macro else False,
-                    "bb_lower_touch": execution.price_at_or_below_bb_lower,
-                    "rsi_oversold": execution.rsi_oversold,
-                    "rvol_confirmed": execution.volume_confirmed,
-                    "reversal_candle": execution.reversao_confirmada,
-                    "target_covers_cost": execution.alvo_cobre_custo,
+                    "ema200_trend": conds["EMA200_TREND"],
+                    "bb_lower_touch": conds["BB_LOWER_TOUCH"],
+                    "rsi_oversold": conds["RSI_OVERSOLD"],
+                    "rvol_confirmed": conds["RVOL_CONFIRMED"],
+                    "target_covers_cost": conds.get("TARGET_COVERS_COST", True),
                     "ia_authorized": self.ai_advisor.is_authorized,
                 }
             }
@@ -326,8 +402,8 @@ class TradingEngine:
     # Execução de ordens
     # ------------------------------------------------------------------
 
-    async def _execute_entry(self, symbol: str, execution) -> None:
-        """Executa uma entrada (compra a mercado)."""
+    async def _execute_entry(self, symbol: str, execution, verdict=None) -> None:
+        """Executa uma entrada (compra a mercado) já autorizada pela IA."""
         cfg = config.trading
 
         # Calcula tamanho da ordem
@@ -360,8 +436,11 @@ class TradingEngine:
                 symbol, price, avg_price, slippage_pct * 100
             )
 
-        # Abre posição na estratégia (usa preço médio executado)
-        ia_snapshot = self.ai_advisor.last_verdict.to_dict()
+        # Abre posição na estratégia (usa preço médio executado).
+        # O snapshot persistido é o veredito DESTA entrada — é o que o botão
+        # "Auditar" do painel exibe com métricas e justificativa do modelo.
+        ia_verdict = verdict or self.ai_advisor.last_verdict
+        ia_snapshot = ia_verdict.to_dict()
         position = self.strategy.open_position(
             symbol=symbol,
             preco_entrada=avg_price,
@@ -386,7 +465,7 @@ class TradingEngine:
             preco=avg_price,
             stop_loss=position.stop_loss,
             take_profit=position.take_profit,
-            ia_motivo=self.ai_advisor.last_verdict.motivo,
+            ia_motivo=ia_verdict.motivo,
         )
 
     async def _execute_exit(self, symbol: str, current_price: float, reason: ExitReason) -> None:
@@ -457,11 +536,13 @@ class TradingEngine:
 
     async def _slow_loop(self) -> None:
         """
-        Camada de Contexto IA — consulta Gemini Flash a cada 30 minutos.
-        Processa métricas macro para autorizar/bloquear o Fast Loop.
+        Contexto Macro — aquece o BTC 4h a cada 30 minutos.
+
+        A decisão de entrada saiu do slow loop: agora a IA audita cada compra
+        no Fast Loop. Este loop só mantém o contexto macro fresco e visível
+        nos logs, evitando que a auditoria espere uma chamada de rede.
         """
-        # Com regras locais (sem Gemini) não há custo de API: reavalia a cada 5 min
-        interval = config.trading.slow_loop_interval if config.trading.usar_ia else 300
+        interval = config.trading.slow_loop_interval
         logger.info("[SLOW] Iniciando Slow Loop (intervalo: %ds = %dmin)", interval, interval // 60)
 
         while self._running:
@@ -473,43 +554,15 @@ class TradingEngine:
             await asyncio.sleep(interval)
 
     async def _slow_cycle(self) -> None:
-        """Um ciclo completo do Slow Loop."""
-        # Coleta métricas
-        btc_var = await self.client.fetch_btc_variation_4h()
-
-        # Funding rate — se disponível (apenas em futuros, usa 0 como default)
-        funding_rate = 0.0  # Binance Spot não tem funding; pode ser estendido
-
-        # ATR de 1h — reutiliza cache compartilhado com o Fast Loop
-        symbol = config.trading.symbol
-        now = time.time()
-        if not self._cached_ohlcv_1h or (now - self._last_ohlcv_1h_fetch) > self._1H_TTL:
-            try:
-                ohlcv_1h = await self.client.fetch_ohlcv(symbol, "1h", limit=250)
-                self._cached_ohlcv_1h = ohlcv_1h
-                self._last_ohlcv_1h_fetch = now
-            except Exception as e:
-                logger.warning("[SLOW] Falha ao buscar OHLCV 1h — usando cache anterior: %s", e)
-        macro = calculate_macro_indicators(self._cached_ohlcv_1h) if self._cached_ohlcv_1h else None
-        atr_1h = macro.atr_1h if macro else 0.0
-        atr_1h_mediana = macro.atr_1h_mediana if macro else 0.0
+        """Um ciclo completo do Slow Loop (contexto macro)."""
+        btc_var = await self._get_btc_variation_4h()
 
         logger.info(
-            "[SLOW] Métricas IA | BTC 4h: %+.2f%% | Funding: %.4f%% | ATR 1h: %.4f",
-            btc_var, funding_rate, atr_1h
+            "[SLOW] Contexto macro | BTC 4h: %+.2f%% | Auditoria DeepSeek por "
+            "entrada: %s",
+            btc_var,
+            "ATIVA" if config.trading.ai_validation_enabled else "DESATIVADA",
         )
-
-        # Consulta IA
-        was_authorized = self._last_ia_was_authorized
-        verdict = await self.ai_advisor.consult(btc_var, funding_rate, atr_1h, atr_1h_mediana)
-
-        # Detecta mudança de estado e notifica
-        if was_authorized and not verdict.autorizado:
-            await self.notifier.notify_ia_lock(verdict.motivo)
-        elif not was_authorized and verdict.autorizado:
-            await self.notifier.notify_ia_unlock(verdict.motivo)
-
-        self._last_ia_was_authorized = verdict.autorizado
 
     # ==================================================================
     # HEARTBEAT (a cada 5 minutos)

@@ -53,7 +53,7 @@ export const Header: React.FC<HeaderProps> = ({
               </span>
             </div>
             <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: "2px" }}>
-              Dual-Speed Engine // Binance Spot Reversion Strategy // Gemini Flash L2
+              Dual-Speed Engine // Binance Spot Reversion Strategy // DeepSeek Entry Audit
             </p>
           </div>
         </div>

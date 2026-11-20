@@ -1,8 +1,9 @@
 """
-Backtest — compara a estratégia ORIGINAL com a v2 em dados históricos reais da Binance.
+Backtest — compara a estratégia ORIGINAL, a variante V2 e a configuração ATUAL (.env)
+em dados históricos reais da Binance.
 
-Usa a MESMA lógica do bot ao vivo (compute_signal_frame + Position.update_dynamic_stops),
-com taxas e spread incluídos.
+Usa a MESMA lógica do bot ao vivo (build_execution + Strategy.evaluate_entry +
+Position.update_dynamic_stops), com taxas e spread incluídos.
 
 Uso (na pasta do projeto, com o venv ativo):
     python -m src.backtest                       # 90 dias de SOL/BRL
@@ -14,6 +15,7 @@ Limitações (leia antes de confiar nos números):
   máxima (conservador para stops). O bot real olha o preço a cada 10s.
 - A versão ORIGINAL decidia no candle ainda em formação; aqui ela é avaliada no
   fechamento, o que tende a deixá-la MELHOR do que foi na prática.
+- A auditoria DeepSeek por entrada não é simulada (considerada aprovada).
 - Resultado passado não garante resultado futuro. Poucos trades = pouca confiança.
 """
 
@@ -27,8 +29,10 @@ import numpy as np
 import pandas as pd
 
 from . import config
-from .indicators import compute_signal_frame, compute_ema, compute_atr
-from .strategy import Position
+from .indicators import (
+    MacroIndicators, build_execution, compute_atr, compute_ema, compute_series_5m,
+)
+from .strategy import Strategy
 
 logging.basicConfig(level=logging.WARNING)
 CACHE_DIR = Path(__file__).resolve().parent.parent / "logs" / "backtest"
@@ -87,12 +91,18 @@ def _alinhar_1h(serie_1h: pd.Series, idx_5m: pd.DatetimeIndex) -> np.ndarray:
 
 
 def simular(df5: pd.DataFrame, df1h: pd.DataFrame, btc1h, cfg, spread_pct: float) -> pd.DataFrame:
+    """
+    Percorre os candles fechados de 5m usando EXATAMENTE as regras do bot:
+    build_execution -> Strategy.evaluate_entry -> Strategy.open_position ->
+    Position.update_dynamic_stops. A auditoria DeepSeek não é simulada
+    (considera-se aprovada); o filtro de regras macro é aplicado.
+    """
     config.trading = cfg  # strategy/indicators leem config.trading em tempo de execução
-    f = compute_signal_frame(df5)
+    s5 = compute_series_5m(df5)
 
-    # Filtros de 1h (tendência + macro)
+    # Filtros de 1h alinhados sem olhar o futuro
     ema = compute_ema(df1h["close"], cfg.ema_period)
-    tendencia = _alinhar_1h((df1h["close"] > ema).astype(float), df5.index)
+    acima_ema = _alinhar_1h((df1h["close"] > ema).astype(float), df5.index)
     atr1 = compute_atr(df1h, cfg.atr_period)
     mediana = atr1.rolling(100).median().shift(1)
     choque = _alinhar_1h((atr1 >= cfg.atr_choque_mult * mediana).astype(float), df5.index)
@@ -101,28 +111,25 @@ def simular(df5: pd.DataFrame, df1h: pd.DataFrame, btc1h, cfg, spread_pct: float
         btc_ok = _alinhar_1h((var4h > cfg.btc_queda_max_4h).astype(float), df5.index)
     else:
         btc_ok = np.ones(len(df5))
+    macro_ok = (np.nan_to_num(choque) == 0) & (np.nan_to_num(btc_ok, nan=1) == 1)
+    if not cfg.filtro_macro_regras:
+        macro_ok = np.ones(len(df5), dtype=bool)
 
-    sinal = (
-        f["bb_touch"].to_numpy() & f["rsi_ok"].to_numpy() & f["rvol_ok"].to_numpy()
-        & f["reversao"].to_numpy() & f["alvo_ok"].to_numpy()
-        & (np.nan_to_num(tendencia) == 1) & (np.nan_to_num(choque) == 0)
-        & (np.nan_to_num(btc_ok, nan=1) == 1)
-    )
-
-    o, h, l, c = (f[k].to_numpy() for k in ("open", "high", "low", "close"))
-    atr, mid = f["atr"].to_numpy(), f["bb_middle"].to_numpy()
+    o, h, l, c = s5["open"], s5["high"], s5["low"], s5["close"]
     idx = df5.index
     hs = spread_pct / 100 / 2          # meio spread: compra no ask, vende no bid
     fee = cfg.taxa_por_lado
 
+    strategy = Strategy()
     banca = cfg.banca_inicial
-    trades, pos, entrada_i = [], None, 0
+    trades, entrada_i = [], 0
     cooldown_ate = idx[0]
     stops_seguidos, dia, pnl_dia, dia_bloqueado = 0, None, 0.0, False
     aquecimento = max(cfg.bb_period, cfg.rsi_period * 3, cfg.rvol_period) + 2
 
     def fechar(i, preco_saida, motivo):
-        nonlocal banca, pos, stops_seguidos, cooldown_ate, pnl_dia, dia_bloqueado
+        nonlocal banca, stops_seguidos, cooldown_ate, pnl_dia, dia_bloqueado
+        pos = strategy.close_position()
         q = pos.quantidade
         pnl = q * (preco_saida - pos.preco_entrada) - fee * q * (pos.preco_entrada + preco_saida)
         banca += pnl
@@ -142,15 +149,15 @@ def simular(df5: pd.DataFrame, df1h: pd.DataFrame, btc1h, cfg, spread_pct: float
             stops_seguidos = 0
         if pnl_dia <= -banca * cfg.drawdown_diario_max:
             dia_bloqueado = True
-        pos = None
 
-    for i in range(aquecimento, len(f) - 1):
+    for i in range(aquecimento, len(c) - 1):
         d = idx[i].date()
         if d != dia:
             dia, pnl_dia, dia_bloqueado = d, 0.0, False
 
+        pos = strategy.position
         if pos is not None:
-            bid_o, bid_l, bid_h, bid_c = o[i] - o[i] * hs, l[i] - l[i] * hs, h[i] - h[i] * hs, c[i] - c[i] * hs
+            bid_o, bid_l, bid_h, bid_c = (x * (1 - hs) for x in (o[i], l[i], h[i], c[i]))
             stop_antes = pos.stop_loss
             if bid_o <= stop_antes:                      # gap abaixo do stop
                 fechar(i, bid_o, pos.update_dynamic_stops(bid_o).value)
@@ -165,19 +172,24 @@ def simular(df5: pd.DataFrame, df1h: pd.DataFrame, btc1h, cfg, spread_pct: float
                 fechar(i, pos.stop_loss, motivo.value if motivo else "STOP_LOSS")
             continue
 
-        if sinal[i] and not dia_bloqueado and idx[i] >= cooldown_ate and atr[i] > 0:
-            preco = o[i + 1] * (1 + hs)                  # entra na abertura seguinte, no ask
-            valor = banca * cfg.ordem_percentual
-            if valor < cfg.min_notional:
-                continue
-            pos = Position(
-                symbol=cfg.symbol, preco_entrada=preco, quantidade=valor / preco,
-                atr_entrada=atr[i], timestamp_in=0, stop_loss=preco - cfg.sl_atr_mult * atr[i],
-                take_profit=preco + cfg.tp_atr_mult * atr[i], highest_price=preco,
-            )
-            if cfg.alvo_na_media and mid[i] > preco * (1 + cfg.custo_ida_volta):
-                pos.take_profit = mid[i]
-            entrada_i = i + 1
+        if dia_bloqueado or idx[i] < cooldown_ate or not np.isfinite(acima_ema[i]):
+            continue
+        execution = build_execution(s5, i)
+        macro = MacroIndicators(
+            ema_200=0.0, price_above_ema=bool(acima_ema[i] == 1),
+            current_close=float(c[i]), atr_1h=0.0,
+        )
+        if not strategy.evaluate_entry(macro, execution, ia_authorized=bool(macro_ok[i])):
+            continue
+        preco = o[i + 1] * (1 + hs)                      # entra na abertura seguinte, no ask
+        valor = banca * cfg.ordem_percentual
+        if valor < cfg.min_notional or not np.isfinite(execution.atr):
+            continue
+        strategy.open_position(
+            symbol=cfg.symbol, preco_entrada=preco, quantidade=valor / preco,
+            atr=execution.atr, alvo=execution.bb_middle,
+        )
+        entrada_i = i + 1
 
     return pd.DataFrame(trades)
 
@@ -208,18 +220,31 @@ def resumo(nome: str, t: pd.DataFrame, banca0: float, dias: int) -> dict:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Backtest: estratégia original vs v2")
+    ap = argparse.ArgumentParser(description="Backtest: original vs v2 vs configuração atual")
     ap.add_argument("--symbol", default=config.trading.symbol)
     ap.add_argument("--dias", type=int, default=90)
     ap.add_argument("--spread", type=float, default=0.10, help="spread médio em %% (ex.: 0.10)")
     args = ap.parse_args()
 
-    base = replace(config.trading, symbol=args.symbol)
+    atual = replace(config.trading, symbol=args.symbol)
+    # Como o bot era no commit 8a8a4c9 (antes das mudanças locais e da v2)
     original = replace(
-        base, exigir_reversao=False, alvo_na_media=False, min_alvo_mult_custo=0.0,
-        min_rr=0.0, be_fee_offset=0.0015, be_min_mult_custo=0.0, trailing_atr_mult=1.0,
+        atual, require_green_candle=False, allow_below_ema_reversal=False,
+        paper_ignore_ema200=False, toque_pela_minima=False, exigir_reversao=False,
+        alvo_na_media=False, min_alvo_mult_custo=0.0, min_rr=0.0,
+        sl_atr_mult=1.5, sl_min_pct=0.0, tp_atr_mult=2.0, tp_min_pct=0.0,
+        be_atr_mult=1.0, be_min_pct=0.0, be_fee_offset=0.0015,
+        trailing_atr_mult=1.0, trailing_min_pct=0.0, rsi_threshold=32.0, rvol_threshold=1.0,
+        filtro_macro_regras=True,
     )
-    v2 = base
+    # Variante V2: setup + candle de reversão, alvo na banda média, filtro alvo x custo
+    v2 = replace(
+        atual, exigir_reversao=True, toque_pela_minima=False, alvo_na_media=True,
+        min_alvo_mult_custo=2.0, min_rr=0.8, allow_below_ema_reversal=False,
+        sl_atr_mult=1.5, sl_min_pct=0.0, tp_min_pct=0.0, be_min_pct=0.006,
+        be_fee_offset=0.003, trailing_atr_mult=0.5, trailing_min_pct=0.0,
+    )
+    perfis = (("ORIGINAL", original), ("V2", v2), ("ATUAL (.env)", atual))
 
     agora = int(time.time() * 1000)
     desde5 = agora - args.dias * 86_400_000
@@ -236,12 +261,12 @@ def main():
     print(f"{len(df5)} candles de 5m | {df5.index[0]} → {df5.index[-1]}")
 
     linhas = []
-    for nome, cfg in (("ORIGINAL", original), ("V2", v2)):
+    for nome, cfg in perfis:
         t = simular(df5, df1h, btc1h, cfg, args.spread)
         linhas.append(resumo(nome, t, cfg.banca_inicial, args.dias))
         if not t.empty:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            t.to_csv(CACHE_DIR / f"trades_{nome.lower()}.csv", index=False)
+            t.to_csv(CACHE_DIR / f"trades_{nome.split()[0].lower()}.csv", index=False)
             print(f"\n{nome} — resultado por tipo de saída:")
             print(t.groupby("motivo").agg(qtd=("pnl_brl", "size"), pnl_brl=("pnl_brl", "sum"),
                                           pnl_medio_pct=("pnl_pct", "mean")).round(3).to_string())
@@ -251,7 +276,8 @@ def main():
     print(pd.DataFrame(linhas).set_index("versão").T.to_string())
     print("=" * 70)
     print(f"Referência — só segurar {args.symbol} no período: {bh:+.2f}% "
-          f"(o bot usa {base.ordem_percentual:.0%} da banca por trade)")
+          f"(o bot usa {atual.ordem_percentual:.0%} da banca por trade)")
+    print("ATUAL = o que o bot roda com o seu .env. A auditoria DeepSeek não é simulada.")
     print(f"Trades salvos em: {CACHE_DIR}")
 
 

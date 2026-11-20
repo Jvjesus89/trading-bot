@@ -26,6 +26,20 @@ export const TradeDetailModal: React.FC<TradeDetailModalProps> = ({ trade, onClo
 
   const ia = trade.ia_snapshot || {};
   const isAuth = ia?.autorizado ?? false;
+  const metricas = ia?.metricas || null;
+  const metricItems = metricas
+    ? [
+        { label: "RSI 5m", value: metricas.rsi != null ? Number(metricas.rsi).toFixed(1) : "--" },
+        { label: "RVOL", value: metricas.rvol != null ? `${Number(metricas.rvol).toFixed(2)}x` : "--" },
+        {
+          label: "BTC 4h",
+          value: metricas.btc_trend_4h != null
+            ? `${Number(metricas.btc_trend_4h) >= 0 ? "+" : ""}${Number(metricas.btc_trend_4h).toFixed(2)}%`
+            : "--",
+        },
+        { label: "Preço", value: metricas.preco != null ? `R$ ${Number(metricas.preco).toFixed(4)}` : "--" },
+      ]
+    : [];
 
   return (
     <div style={{
@@ -81,7 +95,7 @@ export const TradeDetailModal: React.FC<TradeDetailModalProps> = ({ trade, onClo
               Auditoria de IA // Trade {trade.id.slice(0, 8)}...
             </h3>
             <p style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-              Snapshot criptográfico exato submetido e respondido pelo Gemini Flash na autorização
+              Snapshot exato das métricas enviadas ao DeepSeek e do veredito que autorizou esta entrada
             </p>
           </div>
         </div>
@@ -134,7 +148,9 @@ export const TradeDetailModal: React.FC<TradeDetailModalProps> = ({ trade, onClo
         }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
             <span style={{ fontSize: "0.8rem", color: "var(--text-muted)", fontWeight: 600 }}>
-              Veredito Estruturado do Gemini Flash
+              {ia?.fonte === "deepseek"
+                ? `Veredito do DeepSeek${ia?.modelo ? ` (${ia.modelo})` : ""}`
+                : "Auditoria da Entrada"}
             </span>
             <span className={`badge ${isAuth ? "badge-green" : "badge-red"}`}>
               {isAuth ? <CheckCircle2 size={12} /> : <AlertTriangle size={12} />}
@@ -142,8 +158,40 @@ export const TradeDetailModal: React.FC<TradeDetailModalProps> = ({ trade, onClo
             </span>
           </div>
           <p style={{ fontSize: "0.88rem", color: "var(--text-main)", lineHeight: "1.4" }}>
-            "{ia.motivo || "Autorizado com base nas métricas técnicas e de derivativos."}"
+            "{ia.motivo || "Sem justificativa registrada para esta entrada."}"
           </p>
+
+          {metricItems.length > 0 && (
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))",
+              gap: "8px",
+              marginTop: "12px",
+              borderTop: "1px solid var(--border-subtle)",
+              paddingTop: "12px"
+            }}>
+              {metricItems.map((item) => (
+                <div key={item.label}>
+                  <div style={{ fontSize: "0.68rem", color: "var(--text-dim)", textTransform: "uppercase" }}>
+                    {item.label}
+                  </div>
+                  <div className="mono" style={{ fontSize: "0.85rem", color: "var(--text-main)", fontWeight: 600 }}>
+                    {item.value}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {ia?.fonte && ia.fonte !== "deepseek" && (
+            <div style={{ fontSize: "0.7rem", color: "var(--trade-amber)", marginTop: "10px" }}>
+              {ia.fonte === "disabled"
+                ? "Validação de IA desativada — esta entrada não passou pelo modelo."
+                : ia.fonte === "missing_key"
+                  ? "DEEPSEEK_API_KEY ausente — esta entrada não passou pelo modelo."
+                  : "Falha na auditoria de IA — entrada registrada sem aprovação do modelo."}
+            </div>
+          )}
         </div>
 
         {/* JSON Raw Snapshot */}

@@ -2,12 +2,15 @@ import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
 
-
-export async function GET() {
+export async function GET(request: Request) {
   try {
-    // Caminho para logs/bot_state.json (2 níveis acima de frontend)
-    const statePath = path.resolve(process.cwd(), "..", "logs", "bot_state.json");
-    
+    const logsDir = process.env.LOGS_DIR || "/app/logs";
+    let statePath = path.join(logsDir, "bot_state.json");
+
+    if (!fs.existsSync(statePath)) {
+      statePath = path.resolve(process.cwd(), "..", "logs", "bot_state.json");
+    }
+
     if (fs.existsSync(statePath)) {
       const data = fs.readFileSync(statePath, "utf-8");
       const parsed = JSON.parse(data);
@@ -34,10 +37,11 @@ export async function GET() {
         banca_atual: 100.0,
       },
       ia: {
-        autorizado: true,
-        nivel_risco: "BAIXO",
-        motivo: "Aguardando primeira verificação macro do Gemini Flash...",
+        autorizado: false,
+        nivel_risco: "ALTO",
+        motivo: "Aguardando o primeiro setup técnico para auditar uma entrada.",
         timestamp: Date.now() / 1000,
+        fonte: "pending",
       },
       position: null,
       indicators: {
@@ -54,12 +58,12 @@ export async function GET() {
         bb_lower_touch: false,
         rsi_oversold: false,
         rvol_confirmed: false,
-        ia_authorized: true,
+        ia_authorized: false,
       },
     });
   } catch (error: any) {
     return NextResponse.json(
-      { online: false, error: error.message },
+      { online: false, error: error?.message || "Erro interno" },
       { status: 500 }
     );
   }

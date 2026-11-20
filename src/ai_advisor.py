@@ -1,14 +1,23 @@
 """
-Integração com Google Gemini Flash — Camada de Contexto IA (Slow Loop).
-Atua como Auditor de Risco Sistêmico: autoriza ou bloqueia operações
-com base em métricas de derivativos e sentimento macro.
+Auditor de Entrada via DeepSeek — valida cada COMPRA antes da execução.
+
+Diferente do antigo slow loop macro (que liberava/bloqueava o robô inteiro a
+cada 30 min), esta camada audita a entrada específica: preço, RSI (5m), RVOL e
+a tendência do BTC (4h). O veredito é gravado no trade (`ia_snapshot`), então o
+botão "Auditar" do painel mostra exatamente o que o modelo viu e decidiu.
+
+Política de falha (importante):
+- AI_VALIDATION_ENABLED=false  -> PAPER libera, LIVE bloqueia (nunca sem auditor).
+- Chave ausente                -> PAPER segue sem auditoria (fonte "missing_key"),
+                                  LIVE bloqueia.
+- Erro/timeout/HTTP != 200/JSON inválido -> bloqueia a entrada (fail-closed),
+  conforme a regra de segurança operacional.
 """
 
 import json
 import logging
 import re
 import time
-import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -18,38 +27,33 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
-# Número máximo de tentativas para a API do Gemini
-_MAX_RETRIES = 3
-# Backoff: 5s, 15s, 30s — mais conservador para não esgotar quota
-_RETRY_DELAYS = [5.0, 15.0, 30.0]
+# Cache curto do último veredito: o setup técnico pode ficar verde por vários
+# ciclos de 10s. Sem isso o robô chamaria a API (e pagaria) a cada ciclo.
+_AUDIT_CACHE_TTL = 120.0
 
-# Prompt de sistema para o Gemini — define o contrato de resposta
-_SYSTEM_PROMPT = """Você é um auditor de risco sistêmico para um robô de day trade em criptomoedas na Binance Spot.
+_SYSTEM_PROMPT = (
+    "Você é um auditor de trades de alta precisão. "
+    "Responda APENAS com um objeto JSON válido, sem markdown."
+)
 
-Seu papel NÃO é prever preço. Seu papel é identificar anomalias estruturais no mercado que quebram
-a matemática de uma estratégia de reversão à média.
+_TRADE_PROMPT = """Você é um analista quantitativo de criptomoedas.
+O robô identificou um gatilho de COMPRA para {symbol}.
 
-Você receberá 3 métricas:
-1. Variação do BTC nas últimas 4h (em %)
-2. Funding Rate do mercado de futuros
-3. ATR de 1h do ativo-alvo (volatilidade)
+Métricas atuais:
+- Preço: {current_price:.6f}
+- RSI (5m): {rsi:.2f} (Estratégia: Reversão de Fundo)
+- Volume Relativo (RVOL): {rvol:.2f}
+- Tendência do BTC (4h): {btc_trend:+.2f}%
 
-Com base nessas métricas, responda ESTRITAMENTE no formato JSON abaixo.
-Não inclua markdown, blocos de código ou qualquer texto fora do JSON.
+Regra de risco obrigatória: se o BTC estiver em queda brusca (< -1.5%) e o
+RVOL do ativo for baixo (< 2.0), a chance de ser um "falso fundo" é grande.
+Nesse cenário, responda authorized=false.
 
-{
-  "autorizado": true ou false,
-  "nivel_risco": "BAIXO" ou "MEDIO" ou "ALTO" ou "CRITICO",
-  "motivo": "Explicação curta e objetiva da sua análise (máximo 120 caracteres)"
-}
-
-Regras de decisão:
-- autorizado = false se: BTC caiu mais de 3% em 4h, OU funding rate > 0.05% (cascata de liquidação iminente), OU ATR está 3x acima da média normal (choque de volatilidade).
-- autorizado = true em todos os outros casos.
-- nivel_risco CRITICO bloqueia automaticamente as operações.
+Responda APENAS com JSON válido neste formato exato, sem markdown:
+{{"authorized": true, "reason": "explicação curta de até 150 caracteres"}}
 """
 
-# Regex para extrair JSON de dentro de blocos markdown (```json ... ```)
+# Regex para extrair JSON de dentro de blocos markdown (```json ... ```).
 _JSON_CODE_BLOCK_RE = re.compile(
     r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE
 )
@@ -57,67 +61,135 @@ _JSON_CODE_BLOCK_RE = re.compile(
 
 def _extract_json(text: str) -> dict:
     """
-    Tenta parsear JSON diretamente; se falhar, procura dentro de blocos
-    de código markdown (```json ... ```) antes de desistir.
+    Tenta parsear JSON diretamente; se falhar, procura dentro de blocos de
+    código markdown (```json ... ```) e, por fim, no primeiro { ... }.
+    Lança json.JSONDecodeError se nenhuma estratégia funcionar.
     """
-    # Tentativa 1: parse direto
-    text_stripped = text.strip()
+    text_stripped = (text or "").strip()
+    if not text_stripped:
+        raise json.JSONDecodeError("Resposta vazia recebida do modelo", text, 0)
+
     try:
-        return json.loads(text_stripped)
+        parsed = json.loads(text_stripped)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
 
-    # Tentativa 2: extrai de bloco markdown
     match = _JSON_CODE_BLOCK_RE.search(text_stripped)
     if match:
         try:
-            return json.loads(match.group(1))
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
-    # Tentativa 3: procura a primeira ocorrência de { ... } no texto
     brace_start = text_stripped.find("{")
     brace_end = text_stripped.rfind("}")
     if brace_start != -1 and brace_end > brace_start:
         try:
-            return json.loads(text_stripped[brace_start : brace_end + 1])
+            parsed = json.loads(text_stripped[brace_start : brace_end + 1])
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
     raise json.JSONDecodeError("Nenhum JSON válido encontrado na resposta", text, 0)
 
 
+def _coerce_bool(value) -> Optional[bool]:
+    """Normaliza true/false, 1/0 e "sim"/"não" para bool. None = inválido."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "sim", "yes", "autorizado"):
+            return True
+        if normalized in ("false", "0", "nao", "não", "no", "bloqueado"):
+            return False
+    return None
+
+
+def regras_macro(
+    btc_variation_4h: float,
+    atr_1h: float,
+    atr_1h_mediana: float = 0.0,
+) -> tuple[bool, str]:
+    """
+    Filtro macro determinístico: bloqueia entradas quando o BTC caiu forte em 4h
+    ou a volatilidade de 1h está N vezes acima do normal (choque).
+    Retorna (autorizado, motivo).
+    """
+    cfg = config.trading
+    motivos = []
+    if btc_variation_4h <= cfg.btc_queda_max_4h:
+        motivos.append(f"BTC caiu {btc_variation_4h:+.2f}% em 4h")
+    if atr_1h_mediana > 0 and atr_1h >= cfg.atr_choque_mult * atr_1h_mediana:
+        motivos.append(f"choque de volatilidade (ATR 1h {atr_1h / atr_1h_mediana:.1f}x o normal)")
+    if motivos:
+        return False, "; ".join(motivos)
+    return True, "OK"
+
+
 @dataclass
 class AIVerdict:
-    """Resultado da análise da IA."""
+    """Resultado da auditoria de uma entrada."""
     autorizado: bool = False
     nivel_risco: str = "ALTO"
     motivo: str = "Fail-Safe: resposta padrão bloqueante"
     timestamp: float = 0.0
     raw_response: Optional[str] = None
+    # "deepseek" (modelo real), "disabled" (configuração), "missing_key"
+    # (sem chave) ou "error" (API indisponível). Nunca confundir fallback com
+    # aprovação do modelo.
+    fonte: str = "pending"
+    modelo: str = ""
+    metricas: dict = field(default_factory=dict)
 
     def is_stale(self, max_age_seconds: int = 3600) -> bool:
         """Verifica se a leitura está obsoleta (mais de 1h por padrão)."""
         return (time.time() - self.timestamp) > max_age_seconds
 
     def to_dict(self) -> dict:
-        """Serializa para armazenamento/log."""
+        """Serializa para telemetria, persistência e modal de auditoria."""
         return {
             "autorizado": self.autorizado,
             "nivel_risco": self.nivel_risco,
             "motivo": self.motivo,
             "timestamp": self.timestamp,
+            "fonte": self.fonte,
+            "modelo": self.modelo,
+            "metricas": self.metricas,
         }
 
 
 class AIAdvisor:
     """
-    Gerencia consultas periódicas ao Gemini Flash.
-    Implementa Fail-Safe: se a resposta falhar, bloqueia operações.
+    Auditor de entrada DeepSeek.
+
+    O Fast Loop chama `audit_entry()` somente quando os 4 filtros técnicos
+    estão verdes; a ordem só é enviada se o veredito autorizar. O último
+    veredito fica disponível para o dashboard e para o `ia_snapshot` do trade.
     """
 
     def __init__(self):
-        self._last_verdict: AIVerdict = AIVerdict()  # Começa bloqueado (fail-safe)
+        self._last_verdict: AIVerdict = AIVerdict(
+            autorizado=False,
+            nivel_risco="ALTO",
+            motivo="Aguardando primeiro sinal de entrada para auditoria.",
+            timestamp=0.0,
+            fonte="pending",
+            modelo=config.deepseek.model,
+        )
+        self._last_audit_at: float = 0.0
+        self._last_audit_symbol: str = ""
+
+    # ------------------------------------------------------------------
+    # Propriedades de leitura (dashboard / orquestrador)
+    # ------------------------------------------------------------------
 
     @property
     def last_verdict(self) -> AIVerdict:
@@ -126,185 +198,268 @@ class AIAdvisor:
 
     @property
     def is_authorized(self) -> bool:
-        """Atalho: a IA autoriza operações?"""
+        """Atalho: o último veredito autoriza a entrada?"""
         return self._last_verdict.autorizado and not self._last_verdict.is_stale()
 
-    @staticmethod
-    def rule_based_verdict(
-        btc_variation_4h: float,
-        atr_1h: float,
-        atr_1h_mediana: float = 0.0,
-    ) -> AIVerdict:
-        """
-        Filtro macro determinístico — aplica exatamente as regras que o prompt
-        pedia ao Gemini, sem custo, sem latência e sem falhas de API.
-        """
-        cfg = config.trading
-        motivos = []
-        if btc_variation_4h <= cfg.btc_queda_max_4h:
-            motivos.append(f"BTC caiu {btc_variation_4h:+.2f}% em 4h")
-        if atr_1h_mediana > 0 and atr_1h >= cfg.atr_choque_mult * atr_1h_mediana:
-            motivos.append(f"Choque de volatilidade (ATR {atr_1h / atr_1h_mediana:.1f}x o normal)")
+    # ------------------------------------------------------------------
+    # API pública
+    # ------------------------------------------------------------------
 
-        autorizado = not motivos
-        return AIVerdict(
-            autorizado=autorizado,
-            nivel_risco="BAIXO" if autorizado else "ALTO",
-            motivo=("Regras: " + "; ".join(motivos)) if motivos else (
-                f"Regras OK: BTC 4h {btc_variation_4h:+.2f}%, ATR 1h "
-                f"{(atr_1h / atr_1h_mediana) if atr_1h_mediana else 0:.1f}x o normal"
-            ),
-            timestamp=time.time(),
-        )
-
-    async def consult(
+    async def authorize_trade(
         self,
-        btc_variation_4h: float,
-        funding_rate: float,
-        atr_1h: float,
-        atr_1h_mediana: float = 0.0,
-    ) -> AIVerdict:
+        symbol: str,
+        current_price: float,
+        rsi: float,
+        rvol: float,
+        btc_trend: float,
+    ) -> dict:
         """
-        Avalia o contexto macro.
-        - USAR_IA=false (padrão): regras determinísticas.
-        - USAR_IA=true: consulta o Gemini; em falha, cai nas regras em PAPER
-          e bloqueia em LIVE (fail-safe).
+        Consulta o DeepSeek para auditar a entrada antes da execução.
+
+        Contrato: retorna um dict com `authorized` (bool) e `reason` (str).
+        Chaves extras (`fonte`, `latency_ms`) são usadas internamente pelo
+        `audit_entry` para distinguir bloqueio do modelo de falha de API.
+
+        Em caso de falha de comunicação, a entrada é NEGADA (fail-closed).
         """
-        if not config.trading.usar_ia:
-            verdict = self.rule_based_verdict(btc_variation_4h, atr_1h, atr_1h_mediana)
-            logger.info(
-                "[MACRO] Veredito: autorizado=%s | %s", verdict.autorizado, verdict.motivo
-            )
-            self._last_verdict = verdict
-            return verdict
-
-        payload_text = (
-            f"Métricas atuais para análise:\n"
-            f"- Variação BTC (4h): {btc_variation_4h:+.2f}%\n"
-            f"- Funding Rate: {funding_rate:.4f}%\n"
-            f"- ATR 1h do ativo: {atr_1h:.4f}\n"
-            f"- ATR 1h mediano (últimas 100h, referência de normalidade): {atr_1h_mediana:.4f}"
-        )
-
-        request_body = {
-            "system_instruction": {
-                "parts": [{"text": _SYSTEM_PROMPT}]
-            },
-            "contents": [
-                {
-                    "parts": [{"text": payload_text}]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 256,
-                "responseMimeType": "application/json",
+        if not config.trading.ai_validation_enabled:
+            return {
+                "authorized": True,
+                "reason": "Validação de IA desativada",
+                "fonte": "disabled",
             }
+
+        if not config.deepseek.api_key:
+            return {
+                "authorized": True,
+                "reason": "DEEPSEEK_API_KEY ausente",
+                "fonte": "missing_key",
+            }
+
+        prompt = _TRADE_PROMPT.format(
+            symbol=symbol,
+            current_price=current_price,
+            rsi=rsi,
+            rvol=rvol,
+            btc_trend=btc_trend,
+        )
+        payload = {
+            "model": config.deepseek.model,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            # Temperatura baixa: lógica estrita, sem "otimismo" inventado.
+            "temperature": 0.1,
+            "max_tokens": 200,
+            "response_format": {"type": "json_object"},
+        }
+        headers = {
+            "Authorization": f"Bearer {config.deepseek.api_key}",
+            "Content-Type": "application/json",
         }
 
-        # Constrói URL dinamicamente para sempre refletir o modelo configurado
-        api_url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{config.gemini.model}:generateContent?key={config.gemini.api_key}"
-        )
-
+        started = time.perf_counter()
         try:
-            last_error: Optional[Exception] = None
-            for attempt in range(1, _MAX_RETRIES + 1):
-                try:
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        response = await client.post(api_url, json=request_body)
-                        response.raise_for_status()
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(config.deepseek.timeout, connect=5.0)
+            ) as client:
+                response = await client.post(
+                    config.deepseek.api_url, headers=headers, json=payload
+                )
 
-                    data = response.json()
-                    # Extrai o texto gerado
-                    generated_text = (
-                        data.get("candidates", [{}])[0]
-                        .get("content", {})
-                        .get("parts", [{}])[0]
-                        .get("text", "")
+                # Algumas contas/versões da API rejeitam response_format.
+                # Nesse caso repetimos uma única vez sem o modo JSON — o
+                # parser `_extract_json` já cobre markdown/ruído ao redor.
+                if response.status_code == 400:
+                    payload.pop("response_format", None)
+                    response = await client.post(
+                        config.deepseek.api_url, headers=headers, json=payload
                     )
 
-                    # Parse defensivo: aceita JSON puro ou envolto em markdown
-                    result = _extract_json(generated_text)
+            latency_ms = int((time.perf_counter() - started) * 1000)
 
-                    verdict = AIVerdict(
-                        autorizado=bool(result.get("autorizado", False)),
-                        nivel_risco=str(result.get("nivel_risco", "ALTO")),
-                        motivo=str(result.get("motivo", "Resposta sem motivo")),
-                        timestamp=time.time(),
-                        raw_response=generated_text,
-                    )
+            if response.status_code != 200:
+                detalhe = " ".join((response.text or "").split())[:200]
+                logger.error(
+                    "[IA AUDIT] %s | HTTP %d em %dms | %s",
+                    symbol, response.status_code, latency_ms, detalhe or "<sem corpo>",
+                )
+                return {
+                    "authorized": False,
+                    "reason": f"Erro de API HTTP {response.status_code}",
+                    "fonte": "error",
+                    "latency_ms": latency_ms,
+                }
 
-                    logger.info(
-                        "[IA] Veredito: autorizado=%s | risco=%s | motivo=%s",
-                        verdict.autorizado, verdict.nivel_risco, verdict.motivo
-                    )
-                    self._last_verdict = verdict
-                    return verdict
+            try:
+                data = response.json()
+                content = data["choices"][0]["message"]["content"] or ""
+                decision = _extract_json(content)
+                authorized = _coerce_bool(
+                    decision.get("authorized", decision.get("autorizado"))
+                )
+                reason = " ".join(
+                    str(decision.get("reason") or decision.get("motivo") or "").split()
+                )[:200]
+            except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
+                logger.error(
+                    "[IA AUDIT] %s | resposta inválida do DeepSeek: %s",
+                    symbol, exc,
+                )
+                return {
+                    "authorized": False,
+                    "reason": "Resposta inválida do oráculo de IA",
+                    "fonte": "error",
+                    "latency_ms": latency_ms,
+                }
 
-                except httpx.HTTPStatusError as e:
-                    status_code = e.response.status_code
-                    if status_code == 404:
-                        logger.error(
-                            "[IA] HTTP 404: modelo '%s' não encontrado. "
-                            "Verifique GEMINI_MODEL no .env ou o default em config.py.",
-                            config.gemini.model
-                        )
-                        break  # Retry não resolve um modelo inexistente
-                    if status_code in (429, 500, 503) and attempt < _MAX_RETRIES:
-                        wait = _RETRY_DELAYS[attempt - 1]
-                        logger.warning(
-                            "[IA] Erro HTTP %d na API do Gemini (tentativa %d/%d). Aguardando %.0fs...",
-                            status_code, attempt, _MAX_RETRIES, wait
-                        )
-                        await asyncio.sleep(wait)
-                        last_error = e
-                        continue
-                    logger.error(
-                        "[IA] Erro HTTP %d na API do Gemini (modelo: %s): %s",
-                        status_code, config.gemini.model, e.response.text[:300]
-                    )
-                    last_error = e
-                    break
+            if authorized is None:
+                logger.error(
+                    "[IA AUDIT] %s | JSON sem campo booleano 'authorized': %s",
+                    symbol, content[:200],
+                )
+                return {
+                    "authorized": False,
+                    "reason": "Resposta sem veredito booleano",
+                    "fonte": "error",
+                    "latency_ms": latency_ms,
+                }
 
-                except json.JSONDecodeError as e:
-                    logger.error("[IA] Resposta do Gemini não é JSON válido: %s", e)
-                    last_error = e
-                    break
+            if not reason:
+                reason = "Modelo não justificou a decisão"
 
-                except Exception as e:
-                    if attempt < _MAX_RETRIES:
-                        wait = _RETRY_DELAYS[attempt - 1]
-                        logger.warning(
-                            "[IA] Erro na consulta ao Gemini (tentativa %d/%d). Aguardando %.0fs: %s",
-                            attempt, _MAX_RETRIES, wait, e
-                        )
-                        await asyncio.sleep(wait)
-                        last_error = e
-                        continue
-                    logger.error("[IA] Erro na consulta ao Gemini após %d tentativas: %s", _MAX_RETRIES, e)
-                    last_error = e
-                    break
+            logger.info(
+                "[IA AUDIT] %s | %s | autorizado=%s | RSI=%.2f RVOL=%.2f BTC4h=%+.2f%% "
+                "| %dms | motivo=%s",
+                symbol, config.deepseek.model, authorized, rsi, rvol, btc_trend,
+                latency_ms, reason,
+            )
+            return {
+                "authorized": authorized,
+                "reason": reason,
+                "fonte": "deepseek",
+                "latency_ms": latency_ms,
+            }
 
-        except Exception as e:
-            logger.error("[IA] Erro inesperado no bloco de retry: %s", e)
+        except (httpx.TimeoutException, httpx.HTTPError) as exc:
+            logger.error(
+                "[IA AUDIT] %s | timeout/falha de conexão com DeepSeek: %s",
+                symbol, exc,
+            )
+            return {
+                "authorized": False,
+                "reason": "Falha de comunicação com o oráculo de IA",
+                "fonte": "error",
+            }
+        except Exception as exc:  # pragma: no cover - salvaguarda final
+            logger.error(
+                "[IA AUDIT] %s | erro inesperado na auditoria: %s",
+                symbol, exc,
+            )
+            return {
+                "authorized": False,
+                "reason": "Falha interna na auditoria de IA",
+                "fonte": "error",
+            }
 
-        # Fallback inteligente:
-        # Se for modo PAPER, usa auditoria heurística local com base nas métricas macro
-        if config.is_paper():
-            paper_verdict = self.rule_based_verdict(btc_variation_4h, atr_1h, atr_1h_mediana)
-            paper_verdict.motivo = "Fallback (Paper) — " + paper_verdict.motivo
-            logger.warning("[IA] Gemini falhou; usando regras em PAPER: autorizado=%s", paper_verdict.autorizado)
-            self._last_verdict = paper_verdict
-            return paper_verdict
+    async def audit_entry(
+        self,
+        symbol: str,
+        current_price: float,
+        rsi: float,
+        rvol: float,
+        btc_trend: float,
+    ) -> AIVerdict:
+        """
+        Audita uma entrada e devolve o veredito estruturado (AIVerdict).
 
-        # FAIL-SAFE ESTRITO EM LIVE: qualquer falha bloqueia
-        fail_verdict = AIVerdict(
-            autorizado=False,
-            nivel_risco="CRITICO",
-            motivo="Fail-Safe (Live): falha na comunicação com Gemini",
-            timestamp=time.time(),
-        )
-        self._last_verdict = fail_verdict
-        return fail_verdict
+        Aplica a política de modo (PAPER/LIVE), o cache curto e a conversão do
+        contrato `authorized/reason` para o formato consumido pelo dashboard.
+        """
+        now = time.time()
+        if (
+            self._last_audit_at
+            and self._last_audit_symbol == symbol
+            and (now - self._last_audit_at) < _AUDIT_CACHE_TTL
+        ):
+            logger.debug(
+                "[IA AUDIT] Reutilizando veredito de %.0fs atrás para %s",
+                now - self._last_audit_at, symbol,
+            )
+            return self._last_verdict
+
+        metricas = {
+            "preco": round(float(current_price), 6),
+            "rsi": round(float(rsi), 2),
+            "rvol": round(float(rvol), 2),
+            "btc_trend_4h": round(float(btc_trend), 2),
+        }
+
+        if not config.trading.ai_validation_enabled:
+            is_paper = config.is_paper()
+            verdict = AIVerdict(
+                autorizado=is_paper,
+                nivel_risco="BAIXO" if is_paper else "CRITICO",
+                motivo=(
+                    "Validação de IA desativada — PAPER entra sem auditoria"
+                    if is_paper
+                    else "Validação de IA desativada em LIVE — entrada bloqueada (fail-safe)"
+                ),
+                timestamp=now,
+                fonte="disabled",
+                modelo=config.deepseek.model,
+                metricas=metricas,
+            )
+            logger.info("[IA AUDIT] Validação desativada | %s | autorizado=%s", symbol, is_paper)
+
+        elif not config.deepseek.api_key:
+            is_paper = config.is_paper()
+            verdict = AIVerdict(
+                autorizado=is_paper,
+                nivel_risco="BAIXO" if is_paper else "CRITICO",
+                motivo=(
+                    "DEEPSEEK_API_KEY ausente — PAPER entra sem auditoria"
+                    if is_paper
+                    else "DEEPSEEK_API_KEY ausente em LIVE — entrada bloqueada"
+                ),
+                timestamp=now,
+                fonte="missing_key",
+                modelo=config.deepseek.model,
+                metricas=metricas,
+            )
+            logger.error(
+                "[IA AUDIT] DEEPSEEK_API_KEY ausente | %s | autorizado=%s "
+                "(PAPER libera sem auditor; LIVE bloqueia)",
+                symbol, is_paper,
+            )
+
+        else:
+            result = await self.authorize_trade(
+                symbol=symbol,
+                current_price=current_price,
+                rsi=rsi,
+                rvol=rvol,
+                btc_trend=btc_trend,
+            )
+            fonte = str(result.get("fonte", "error"))
+            autorizado = bool(result.get("authorized"))
+            if fonte == "deepseek":
+                nivel_risco = "BAIXO" if autorizado else "ALTO"
+            else:
+                # Falha de API/parse: bloqueio crítico, não "risco de mercado".
+                nivel_risco = "CRITICO"
+            verdict = AIVerdict(
+                autorizado=autorizado,
+                nivel_risco=nivel_risco,
+                motivo=str(result.get("reason") or "Sem justificativa"),
+                timestamp=now,
+                fonte=fonte,
+                modelo=config.deepseek.model,
+                metricas=metricas,
+            )
+
+        self._last_verdict = verdict
+        self._last_audit_at = now
+        self._last_audit_symbol = symbol
+        return verdict
