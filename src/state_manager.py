@@ -79,7 +79,7 @@ class StateManager:
 
             # Busca ATR atual para recalcular stops
             try:
-                ohlcv_5m = await self._exchange.fetch_ohlcv(symbol, "5m", limit=50)
+                ohlcv_5m = await self._exchange.fetch_ohlcv(symbol, "5m", limit=150)
                 from .indicators import calculate_execution_indicators
                 exec_indicators = calculate_execution_indicators(ohlcv_5m)
                 atr = exec_indicators.atr if exec_indicators else preco_entrada * 0.01

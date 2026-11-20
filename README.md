@@ -97,3 +97,16 @@ trading-bot/
 - **Auditor de IA (Gemini Flash L2)**: Nível de risco, autorização e justificativa técnica de mercado.
 - **Livro de Registros**: Histórico de compras e vendas, PnL líquido em R$ e %, badges de saída (Take Profit, Breakeven, Trailing, Stop Loss) e modal com snapshot JSON da auditoria de IA.
 - **KPIs em Tempo Real**: Saldo da banca, PnL do dia com barra de limite do Drawdown (-R$ 6,00) e status dos Circuit Breakers.
+
+## Backtest (original vs v2)
+
+Antes de mudar qualquer parâmetro, valide em dados históricos reais:
+
+```bash
+python -m src.backtest                 # 90 dias de SOL/BRL
+python -m src.backtest --dias 180 --spread 0.12
+```
+
+O relatório compara as duas versões (acerto, ganho/perda médios, profit factor,
+drawdown) e salva os trades em `logs/backtest/`. Os parâmetros da v2 ficam no `.env`
+(veja a seção "Estratégia v2" do `.env.example`).

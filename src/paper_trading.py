@@ -139,7 +139,8 @@ class PaperTradingClient:
         ticker = await self._exchange.fetch_ticker(symbol)
         price = ticker.get("ask", ticker.get("last", 0))
 
-        cost = amount * price
+        # Inclui a taxa da Binance (antes o paper ignorava taxas no saldo)
+        cost = amount * price * (1 + config.trading.taxa_por_lado)
         quote = config.trading.quote_currency
         base = config.trading.base_currency
 
@@ -179,7 +180,7 @@ class PaperTradingClient:
         ticker = await self._exchange.fetch_ticker(symbol)
         price = ticker.get("bid", ticker.get("last", 0))
 
-        revenue = amount * price
+        revenue = amount * price * (1 - config.trading.taxa_por_lado)
         quote = config.trading.quote_currency
         base = config.trading.base_currency
 

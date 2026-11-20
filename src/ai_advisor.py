@@ -129,21 +129,61 @@ class AIAdvisor:
         """Atalho: a IA autoriza operações?"""
         return self._last_verdict.autorizado and not self._last_verdict.is_stale()
 
+    @staticmethod
+    def rule_based_verdict(
+        btc_variation_4h: float,
+        atr_1h: float,
+        atr_1h_mediana: float = 0.0,
+    ) -> AIVerdict:
+        """
+        Filtro macro determinístico — aplica exatamente as regras que o prompt
+        pedia ao Gemini, sem custo, sem latência e sem falhas de API.
+        """
+        cfg = config.trading
+        motivos = []
+        if btc_variation_4h <= cfg.btc_queda_max_4h:
+            motivos.append(f"BTC caiu {btc_variation_4h:+.2f}% em 4h")
+        if atr_1h_mediana > 0 and atr_1h >= cfg.atr_choque_mult * atr_1h_mediana:
+            motivos.append(f"Choque de volatilidade (ATR {atr_1h / atr_1h_mediana:.1f}x o normal)")
+
+        autorizado = not motivos
+        return AIVerdict(
+            autorizado=autorizado,
+            nivel_risco="BAIXO" if autorizado else "ALTO",
+            motivo=("Regras: " + "; ".join(motivos)) if motivos else (
+                f"Regras OK: BTC 4h {btc_variation_4h:+.2f}%, ATR 1h "
+                f"{(atr_1h / atr_1h_mediana) if atr_1h_mediana else 0:.1f}x o normal"
+            ),
+            timestamp=time.time(),
+        )
+
     async def consult(
         self,
         btc_variation_4h: float,
         funding_rate: float,
         atr_1h: float,
+        atr_1h_mediana: float = 0.0,
     ) -> AIVerdict:
         """
-        Submete payload ao Gemini e interpreta a resposta.
-        Em caso de qualquer falha, retorna veredito bloqueante (fail-safe).
+        Avalia o contexto macro.
+        - USAR_IA=false (padrão): regras determinísticas.
+        - USAR_IA=true: consulta o Gemini; em falha, cai nas regras em PAPER
+          e bloqueia em LIVE (fail-safe).
         """
+        if not config.trading.usar_ia:
+            verdict = self.rule_based_verdict(btc_variation_4h, atr_1h, atr_1h_mediana)
+            logger.info(
+                "[MACRO] Veredito: autorizado=%s | %s", verdict.autorizado, verdict.motivo
+            )
+            self._last_verdict = verdict
+            return verdict
+
         payload_text = (
             f"Métricas atuais para análise:\n"
             f"- Variação BTC (4h): {btc_variation_4h:+.2f}%\n"
             f"- Funding Rate: {funding_rate:.4f}%\n"
-            f"- ATR 1h do ativo: {atr_1h:.4f}"
+            f"- ATR 1h do ativo: {atr_1h:.4f}\n"
+            f"- ATR 1h mediano (últimas 100h, referência de normalidade): {atr_1h_mediana:.4f}"
         )
 
         request_body = {
@@ -253,16 +293,9 @@ class AIAdvisor:
         # Fallback inteligente:
         # Se for modo PAPER, usa auditoria heurística local com base nas métricas macro
         if config.is_paper():
-            btc_ok = btc_variation_4h > -3.0
-            funding_ok = funding_rate < 0.05
-            paper_auth = btc_ok and funding_ok
-            paper_verdict = AIVerdict(
-                autorizado=paper_auth,
-                nivel_risco="BAIXO" if paper_auth else "ALTO",
-                motivo=f"Fallback Macro (Paper): BTC 4h={btc_variation_4h:+.2f}%, Funding={funding_rate:.4f}%",
-                timestamp=time.time(),
-            )
-            logger.warning("[IA] Usando auditoria heurística de fallback para PAPER: autorizado=%s", paper_auth)
+            paper_verdict = self.rule_based_verdict(btc_variation_4h, atr_1h, atr_1h_mediana)
+            paper_verdict.motivo = "Fallback (Paper) — " + paper_verdict.motivo
+            logger.warning("[IA] Gemini falhou; usando regras em PAPER: autorizado=%s", paper_verdict.autorizado)
             self._last_verdict = paper_verdict
             return paper_verdict
 

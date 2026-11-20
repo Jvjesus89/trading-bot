@@ -41,8 +41,36 @@ class TradingConfig:
     sl_atr_mult: float = 1.5     # Stop Loss = Entrada - 1.5 * ATR
     tp_atr_mult: float = 2.0     # Take Profit = Entrada + 2.0 * ATR
     be_atr_mult: float = 1.0     # Breakeven ativa quando lucro >= 1.0 * ATR
-    be_fee_offset: float = 0.0015  # 0.15% para cobrir taxas no breakeven
-    trailing_atr_mult: float = 1.0  # Trailing stop segue com distância de 1.0 * ATR
+    # Breakeven: stop vai para entrada + custo de ida e volta (antes era 0.15%,
+    # que NÃO cobria 0.2% de taxas + spread — todo "breakeven" fechava no prejuízo)
+    be_fee_offset: float = float(os.getenv("BE_OFFSET_PCT", "0.30")) / 100.0
+    # O breakeven só ativa depois que o lucro flutuante passar de N x custo
+    be_min_mult_custo: float = float(os.getenv("BE_MIN_MULT_CUSTO", "2.0"))
+    # Trailing após atingir o alvo (média de Bollinger): distância de 0.5 * ATR
+    trailing_atr_mult: float = float(os.getenv("TRAILING_ATR_MULT", "0.5"))
+
+    # --- Custos reais de execução ---
+    taxa_por_lado: float = float(os.getenv("TAXA_POR_LADO_PCT", "0.10")) / 100.0
+    # Custo total estimado ida+volta: taxas (2 x 0.10%) + spread médio do SOL/BRL
+    custo_ida_volta: float = float(os.getenv("CUSTO_IDA_VOLTA_PCT", "0.30")) / 100.0
+
+    # --- Filtros de qualidade do sinal (v2) ---
+    # Sinais só em candles 5m FECHADOS (antes: candle em formação, que "repinta")
+    sinal_candle_fechado: bool = os.getenv("SINAL_CANDLE_FECHADO", "true").lower() == "true"
+    # Exige candle de reversão: candle anterior fez o setup e o último fechou verde
+    # e de volta acima da banda inferior (evita "pegar faca caindo")
+    exigir_reversao: bool = os.getenv("EXIGIR_REVERSAO", "true").lower() == "true"
+    # Alvo = banda média de Bollinger (o "retorno à média" da estratégia)
+    alvo_na_media: bool = os.getenv("ALVO_NA_MEDIA", "true").lower() == "true"
+    # Só entra se a distância até o alvo for >= N x custo de ida e volta
+    min_alvo_mult_custo: float = float(os.getenv("MIN_ALVO_MULT_CUSTO", "2.0"))
+    # Só entra se (distância até o alvo) >= MIN_RR x (distância até o stop)
+    min_rr: float = float(os.getenv("MIN_RR", "0.8"))
+
+    # --- Filtro macro (substitui a chamada ao Gemini por regras determinísticas) ---
+    usar_ia: bool = os.getenv("USAR_IA", "false").lower() == "true"
+    btc_queda_max_4h: float = float(os.getenv("BTC_QUEDA_MAX_4H_PCT", "-3.0"))
+    atr_choque_mult: float = float(os.getenv("ATR_CHOQUE_MULT", "3.0"))
 
     # Slippage
     slippage_max: float = 0.003  # 0.3% — alerta de HIGH_SLIPPAGE

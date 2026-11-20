@@ -68,23 +68,29 @@ class Position:
                 return ExitReason.STOP_LOSS
 
         # --- CHECK 2: Promoção para Breakeven ---
+        # Só move o stop quando o lucro já paga com folga o custo de ida e volta.
         lucro_flutuante = current_price - self.preco_entrada
-        breakeven_trigger = cfg.be_atr_mult * self.atr_entrada
+        breakeven_trigger = max(
+            cfg.be_atr_mult * self.atr_entrada,
+            cfg.be_min_mult_custo * cfg.custo_ida_volta * self.preco_entrada,
+        )
+        stop_be = self.preco_entrada * (1 + cfg.be_fee_offset)
 
         if self.stop_state == StopState.INITIAL and lucro_flutuante >= breakeven_trigger:
-            # Move stop para Preço de Entrada + 0.15% (cobrindo taxas)
-            novo_stop = self.preco_entrada * (1 + cfg.be_fee_offset)
-            self.stop_loss = novo_stop
+            # Move stop para Preço de Entrada + custo (taxas + spread)
+            self.stop_loss = max(self.stop_loss, stop_be)
             self.stop_state = StopState.BREAKEVEN
             logger.info(
-                "[STRATEGY] 🛡️ Breakeven ativado | Novo SL: R$ %.4f (entrada + taxas)",
-                novo_stop
+                "[STRATEGY] 🛡️ Breakeven ativado | Novo SL: R$ %.4f (entrada + custos)",
+                self.stop_loss
             )
 
-        # --- CHECK 3: Promoção para Trailing Stop ---
+        # --- CHECK 3: Alvo atingido → trailing curto (nunca abaixo do breakeven) ---
         if current_price >= self.take_profit:
-            # Não executa TP imediatamente — ativa trailing
-            trailing_stop = self.highest_price - (cfg.trailing_atr_mult * self.atr_entrada)
+            trailing_stop = max(
+                self.highest_price - (cfg.trailing_atr_mult * self.atr_entrada),
+                stop_be,
+            )
 
             if trailing_stop > self.stop_loss:
                 self.stop_loss = trailing_stop
@@ -118,14 +124,16 @@ class Strategy:
         ia_snapshot: Optional[dict] = None,
     ) -> bool:
         """
-        Avalia se todas as 5 condições de entrada são verdadeiras.
-        
+        Avalia se todas as condições de entrada são verdadeiras.
+
         Condições:
         1. Filtro de Tendência (1h): Preço acima da EMA 200
-        2. Exaustão de Curto Prazo (5m): Preço na Banda Inferior de Bollinger
+        2. Exaustão de Curto Prazo (5m): Fechamento na/abaixo da Banda Inferior
         3. Sobrevenda (5m): RSI < 32
         4. Confirmação de Liquidez: RVOL > 1.0
-        5. Aval Macro (IA): Autorizado = True
+        5. Candle de reversão (se EXIGIR_REVERSAO): candle seguinte fechou verde
+        6. Alvo cobre custo: distância até a média >= N x custos e >= MIN_RR x stop
+        7. Aval Macro: filtro de regras (ou Gemini, se USAR_IA=true)
         
         Returns:
             True se todas as condições são atendidas.
@@ -133,28 +141,33 @@ class Strategy:
         if self.is_positioned:
             return False
 
+        cfg = config.trading
         conditions = {
             "EMA200_TREND": macro.price_above_ema,
             "BB_LOWER_TOUCH": execution.price_at_or_below_bb_lower,
             "RSI_OVERSOLD": execution.rsi_oversold,
             "RVOL_CONFIRMED": execution.volume_confirmed,
-            "IA_AUTHORIZED": ia_authorized,
         }
+        if cfg.exigir_reversao:
+            conditions["REVERSAL_CANDLE"] = execution.reversao_confirmada
+        conditions["TARGET_COVERS_COST"] = execution.alvo_cobre_custo
+        conditions["MACRO_AUTHORIZED"] = ia_authorized
 
         all_met = all(conditions.values())
 
         # Log detalhado apenas quando há pelo menos 3 condições ativas
         active_count = sum(1 for v in conditions.values() if v)
-        if active_count >= 3 or all_met:
+        if active_count >= len(conditions) - 2 or all_met:
             status = " | ".join(
                 f"{'✅' if v else '❌'} {k}" for k, v in conditions.items()
             )
-            logger.info("[STRATEGY] Gatilhos (%d/5): %s", active_count, status)
+            logger.info("[STRATEGY] Gatilhos (%d/%d): %s", active_count, len(conditions), status)
 
         if all_met:
             logger.info(
-                "[STRATEGY] 🎯 SINAL DE ENTRADA CONFIRMADO | Preço: R$ %.4f | RSI: %.1f | RVOL: %.2f",
-                execution.current_close, execution.rsi, execution.rvol
+                "[STRATEGY] 🎯 SINAL DE ENTRADA CONFIRMADO | Preço: R$ %.4f | RSI: %.1f | "
+                "RVOL: %.2f | Distância até o alvo: %.2f%%",
+                execution.current_close, execution.rsi, execution.rvol, execution.distancia_alvo_pct
             )
 
         return all_met
@@ -166,6 +179,7 @@ class Strategy:
         quantidade: float,
         atr: float,
         ia_snapshot: Optional[dict] = None,
+        alvo: Optional[float] = None,
     ) -> Position:
         """
         Abre uma posição e calcula os stops dinâmicos iniciais.
@@ -177,6 +191,9 @@ class Strategy:
 
         stop_loss = preco_entrada - (cfg.sl_atr_mult * atr)
         take_profit = preco_entrada + (cfg.tp_atr_mult * atr)
+        # Alvo na banda média (reversão à média), se ainda estiver acima da entrada + custos
+        if cfg.alvo_na_media and alvo and alvo > preco_entrada * (1 + cfg.custo_ida_volta):
+            take_profit = alvo
 
         self.position = Position(
             symbol=symbol,
@@ -192,9 +209,9 @@ class Strategy:
 
         logger.info(
             "[STRATEGY] 🟢 POSIÇÃO ABERTA | %s | Entrada: R$ %.4f | "
-            "SL: R$ %.4f (-%s ATR) | TP: R$ %.4f (+%s ATR) | Qtd: %.6f",
+            "SL: R$ %.4f (-%s ATR) | TP: R$ %.4f | Qtd: %.6f",
             symbol, preco_entrada, stop_loss, cfg.sl_atr_mult,
-            take_profit, cfg.tp_atr_mult, quantidade
+            take_profit, quantidade
         )
 
         return self.position

@@ -69,6 +69,7 @@ class TradingEngine:
         self._current_trade_id: str = ""
         self._running = True
         self._last_ia_was_authorized = False  # Para detectar mudanças de estado IA
+        self._last_entry_candle_ts: int = 0   # Evita 2 entradas no mesmo sinal/candle
 
         # Cache de OHLCV 1h — renovado a cada 5 minutos, compartilhado entre Fast e Slow loops
         self._cached_ohlcv_1h: list = []
@@ -203,7 +204,8 @@ class TradingEngine:
         ohlcv_1h = self._cached_ohlcv_1h
 
         # Candles 5m: leves, buscados a cada ciclo de 10s
-        ohlcv_5m = await self.client.fetch_ohlcv(symbol, "5m", limit=50)
+        # 150 candles: dá aquecimento suficiente para o RSI/ATR exponenciais
+        ohlcv_5m = await self.client.fetch_ohlcv(symbol, "5m", limit=150)
 
         # --- Calcula indicadores ---
         macro = calculate_macro_indicators(ohlcv_1h)
@@ -219,7 +221,8 @@ class TradingEngine:
         # --- Se posicionado: gerencia saída ---
         if self.strategy.is_positioned:
             ticker = await self.client.fetch_ticker(symbol)
-            current_price = ticker.get("last", execution.current_close)
+            # Venda a mercado executa no BID — é ele que decide se o stop foi atingido
+            current_price = ticker.get("bid") or ticker.get("last") or execution.current_close
             exit_reason = self.strategy.check_exit(current_price)
 
             if exit_reason:
@@ -229,14 +232,21 @@ class TradingEngine:
         # --- Se não posicionado: avalia entrada ---
         ia_authorized = self.ai_advisor.is_authorized
 
+        # Um sinal (candle) = no máximo uma entrada
+        if execution.candle_ts and execution.candle_ts == self._last_entry_candle_ts:
+            return
+
         if self.strategy.evaluate_entry(macro, execution, ia_authorized):
+            self._last_entry_candle_ts = execution.candle_ts
             await self._execute_entry(symbol, execution)
 
     async def _monitor_position(self, symbol: str) -> None:
         """Monitora stops mesmo quando circuit breaker está ativo."""
         try:
             ticker = await self.client.fetch_ticker(symbol)
-            current_price = ticker.get("last", 0)
+            current_price = ticker.get("bid") or ticker.get("last") or 0
+            if not current_price:
+                return
             exit_reason = self.strategy.check_exit(current_price)
             if exit_reason:
                 await self._execute_exit(symbol, current_price, exit_reason)
@@ -290,6 +300,7 @@ class TradingEngine:
                     "bb_lower": round(execution.bb_lower, 4),
                     "atr": round(execution.atr, 4),
                     "rvol": round(execution.rvol, 2),
+                    "distancia_alvo_pct": round(execution.distancia_alvo_pct, 3),
                     "ema_200": round(macro.ema_200, 4) if macro else None,
                 },
                 "signals": {
@@ -297,6 +308,8 @@ class TradingEngine:
                     "bb_lower_touch": execution.price_at_or_below_bb_lower,
                     "rsi_oversold": execution.rsi_oversold,
                     "rvol_confirmed": execution.volume_confirmed,
+                    "reversal_candle": execution.reversao_confirmada,
+                    "target_covers_cost": execution.alvo_cobre_custo,
                     "ia_authorized": self.ai_advisor.is_authorized,
                 }
             }
@@ -355,6 +368,7 @@ class TradingEngine:
             quantidade=filled,
             atr=execution.atr,
             ia_snapshot=ia_snapshot,
+            alvo=execution.bb_middle,
         )
 
         # Persiste trade
@@ -446,7 +460,8 @@ class TradingEngine:
         Camada de Contexto IA — consulta Gemini Flash a cada 30 minutos.
         Processa métricas macro para autorizar/bloquear o Fast Loop.
         """
-        interval = config.trading.slow_loop_interval
+        # Com regras locais (sem Gemini) não há custo de API: reavalia a cada 5 min
+        interval = config.trading.slow_loop_interval if config.trading.usar_ia else 300
         logger.info("[SLOW] Iniciando Slow Loop (intervalo: %ds = %dmin)", interval, interval // 60)
 
         while self._running:
@@ -477,6 +492,7 @@ class TradingEngine:
                 logger.warning("[SLOW] Falha ao buscar OHLCV 1h — usando cache anterior: %s", e)
         macro = calculate_macro_indicators(self._cached_ohlcv_1h) if self._cached_ohlcv_1h else None
         atr_1h = macro.atr_1h if macro else 0.0
+        atr_1h_mediana = macro.atr_1h_mediana if macro else 0.0
 
         logger.info(
             "[SLOW] Métricas IA | BTC 4h: %+.2f%% | Funding: %.4f%% | ATR 1h: %.4f",
@@ -485,7 +501,7 @@ class TradingEngine:
 
         # Consulta IA
         was_authorized = self._last_ia_was_authorized
-        verdict = await self.ai_advisor.consult(btc_var, funding_rate, atr_1h)
+        verdict = await self.ai_advisor.consult(btc_var, funding_rate, atr_1h, atr_1h_mediana)
 
         # Detecta mudança de estado e notifica
         if was_authorized and not verdict.autorizado:
