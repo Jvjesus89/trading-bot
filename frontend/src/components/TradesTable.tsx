@@ -65,7 +65,7 @@ export const TradesTable: React.FC<TradesTableProps> = ({ trades }) => {
               Livro de Registros // Compras e Vendas
             </h3>
             <p style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-              Execuções registradas na base de dados com auditoria de slippage e taxas (0.2%)
+              Execuções registradas com auditoria de slippage, taxas (0.2%) e veredito da IA por entrada
             </p>
           </div>
         </div>

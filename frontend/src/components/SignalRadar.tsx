@@ -25,9 +25,12 @@ interface SignalRadarProps {
   signals: SignalsData;
   indicators: IndicatorsData;
   currentPrice: number;
+  // True quando a validação está desativada ou sem chave: a 5ª regra não
+  // bloqueia a entrada (PAPER); em LIVE o backend bloqueia por fail-safe.
+  iaDisabled?: boolean;
 }
 
-export const SignalRadar: React.FC<SignalRadarProps> = ({ signals, indicators, currentPrice }) => {
+export const SignalRadar: React.FC<SignalRadarProps> = ({ signals, indicators, currentPrice, iaDisabled = false }) => {
   const rules = [
     {
       id: "ema",
@@ -63,11 +66,11 @@ export const SignalRadar: React.FC<SignalRadarProps> = ({ signals, indicators, c
     },
     {
       id: "ia",
-      title: "5. Auditoria Gemini Flash",
-      desc: "Validação macroeconômica e sem cascata",
+      title: iaDisabled ? "5. Auditoria de IA (desativada)" : "5. Auditoria de Entrada (DeepSeek)",
+      desc: iaDisabled ? "Validação de IA desligada — não bloqueia entradas" : "Audita RSI, RVOL e tendência do BTC antes da ordem",
       active: signals.ia_authorized,
-      currentValue: signals.ia_authorized ? "Autorizado" : "Bloqueado",
-      target: "Veredito = true",
+      currentValue: iaDisabled ? "Desativada (sem auditoria)" : signals.ia_authorized ? "Autorizado" : "Aguardando/Bloqueado",
+      target: iaDisabled ? "Não aplicável" : "Veredito = autorizado",
     },
   ];
 
@@ -90,7 +93,9 @@ export const SignalRadar: React.FC<SignalRadarProps> = ({ signals, indicators, c
               Radar de Gatilhos de Entrada (5 Condições Simultâneas)
             </h3>
             <p style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-              Para disparar compra a mercado (R$ 25), todas as 5 regras devem estar verdes.
+              {iaDisabled
+                ? "Para disparar compra a mercado (R$ 25): 4 regras técnicas verdes (IA desativada, não bloqueia)."
+                : "Para disparar compra a mercado (R$ 25): 4 regras técnicas verdes + auditoria DeepSeek favorável."}
             </p>
           </div>
         </div>

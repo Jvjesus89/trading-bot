@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -25,8 +26,8 @@ except ImportError:
 
 class LocalFallbackStore:
     """
-    Fallback local quando Supabase não está configurado.
-    Persiste trades em arquivo JSON.
+    Fallback local quando Supabase não está configurado ou offline.
+    Persiste trades em arquivo JSON (logs/trades.json).
     """
 
     def __init__(self, filepath: str = "logs/trades.json"):
@@ -36,21 +37,23 @@ class LocalFallbackStore:
 
     def _load(self) -> None:
         try:
-            with open(self._filepath, "r") as f:
-                self._trades = json.load(f)
+            with open(self._filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self._trades = data if isinstance(data, list) else []
         except (FileNotFoundError, json.JSONDecodeError):
             self._trades = []
 
     def _save(self) -> None:
-        import os
         os.makedirs(os.path.dirname(self._filepath) or ".", exist_ok=True)
-        with open(self._filepath, "w") as f:
+        with open(self._filepath, "w", encoding="utf-8") as f:
             json.dump(self._trades, f, indent=2, default=str)
 
     def insert_trade(self, trade: dict) -> str:
-        trade_id = str(uuid.uuid4())
+        trade_id = trade.get("id") or str(uuid.uuid4())
         trade["id"] = trade_id
-        self._trades.append(trade)
+        # Evita duplicatas se o trade já existir
+        self._trades = [t for t in self._trades if t.get("id") != trade_id]
+        self._trades.insert(0, trade)
         self._save()
         return trade_id
 
@@ -62,7 +65,7 @@ class LocalFallbackStore:
         self._save()
 
     def get_open_trade(self, symbol: str) -> Optional[dict]:
-        for t in reversed(self._trades):
+        for t in self._trades:
             if t.get("symbol") == symbol and t.get("timestamp_out") is None:
                 return t
         return None
@@ -73,7 +76,7 @@ class LocalFallbackStore:
         for t in self._trades:
             ts_out = t.get("timestamp_out", "")
             if ts_out and str(ts_out).startswith(hoje):
-                total += float(t.get("pnl_liquido", 0))
+                total += float(t.get("pnl_liquido", 0) or 0)
         return total
 
 
@@ -81,7 +84,7 @@ class PersistenceManager:
     """
     Interface unificada de persistência.
     Usa Supabase (schema trading_bot ou public) quando configurado,
-    com fallback local em logs/trades.json.
+    mantendo sempre espelhamento duplo em logs/trades.json para consumo do frontend.
     """
 
     def __init__(self):
@@ -114,19 +117,32 @@ class PersistenceManager:
                             "[PERSIST] Conectado ao Supabase no schema '%s.bot_trades': %s",
                             self._schema_name, cfg.url
                         )
-                        return
                 except Exception as s_err:
                     logger.debug("[PERSIST] Schema %s direto não retornou dados: %s", self._schema_name, s_err)
 
-                # 2. Tenta acessar no schema padrão (public)
-                try:
-                    self._client.table("bot_trades").select("id").limit(1).execute()
-                    self._use_schema = False
-                    self._use_supabase = True
-                    logger.info("[PERSIST] Conectado ao Supabase em 'public.bot_trades': %s", cfg.url)
+                # 2. Se não conectou no schema, tenta acessar no schema padrão (public)
+                if not self._use_supabase:
+                    try:
+                        self._client.table("bot_trades").select("id").limit(1).execute()
+                        self._use_schema = False
+                        self._use_supabase = True
+                        logger.info("[PERSIST] Conectado ao Supabase em 'public.bot_trades': %s", cfg.url)
+                    except Exception as p_err:
+                        logger.debug("[PERSIST] public.bot_trades não retornou dados: %s", p_err)
+
+                # 3. Se conectou no Supabase, sincroniza histórico existente para logs/trades.json
+                if self._use_supabase:
+                    try:
+                        res = self._table().select("*").order("timestamp_in", desc=True).limit(100).execute()
+                        if res.data:
+                            os.makedirs("logs", exist_ok=True)
+                            with open("logs/trades.json", "w", encoding="utf-8") as f:
+                                json.dump(res.data, f, indent=2, default=str)
+                            self._fallback._load()
+                            logger.info("[PERSIST] Sincronizados %d trades do Supabase para logs/trades.json", len(res.data))
+                    except Exception as sync_err:
+                        logger.debug("[PERSIST] Não foi possível sincronizar histórico inicial: %s", sync_err)
                     return
-                except Exception as p_err:
-                    logger.debug("[PERSIST] public.bot_trades não retornou dados: %s", p_err)
 
                 # Se ambos falharem, ativa fallback amigável
                 self._use_supabase = False
@@ -164,17 +180,19 @@ class PersistenceManager:
             "ia_snapshot": ia_snapshot,
         }
 
+        trade_id = None
         if self._use_supabase:
             try:
                 result = self._table().insert(trade_data).execute()
                 trade_id = result.data[0]["id"]
                 logger.info("[PERSIST] Trade registrado no Supabase | ID: %s", trade_id)
-                return trade_id
             except Exception as e:
-                logger.error("[PERSIST] Erro ao inserir no Supabase: %s | Usando fallback", e)
+                logger.error("[PERSIST] Erro ao inserir no Supabase: %s | Usando fallback local", e)
 
+        # Dual-write: espelha sempre no fallback local para o frontend ler imediatamente
+        if trade_id:
+            trade_data["id"] = trade_id
         trade_id = self._fallback.insert_trade(trade_data)
-        logger.info("[PERSIST] Trade registrado localmente | ID: %s", trade_id)
         return trade_id
 
     async def record_exit(
@@ -192,6 +210,7 @@ class PersistenceManager:
         now = datetime.now(timezone.utc).isoformat()
 
         # Busca preço de entrada
+        preco_entrada = 0.0
         if self._use_supabase:
             try:
                 result = (
@@ -200,10 +219,12 @@ class PersistenceManager:
                     .eq("id", trade_id)
                     .execute()
                 )
-                preco_entrada = float(result.data[0]["preco_entrada"])
+                if result.data:
+                    preco_entrada = float(result.data[0]["preco_entrada"])
             except Exception:
-                preco_entrada = 0.0
-        else:
+                pass
+
+        if preco_entrada == 0.0:
             trade = next(
                 (t for t in self._fallback._trades if t.get("id") == trade_id),
                 None
@@ -228,9 +249,9 @@ class PersistenceManager:
                 logger.info("[PERSIST] Trade atualizado no Supabase | ID: %s", trade_id)
             except Exception as e:
                 logger.error("[PERSIST] Erro ao atualizar Supabase: %s", e)
-                self._fallback.update_trade(trade_id, updates)
-        else:
-            self._fallback.update_trade(trade_id, updates)
+
+        # Dual-write: atualiza também no fallback local
+        self._fallback.update_trade(trade_id, updates)
 
         logger.info(
             "[PERSIST] Trade fechado | PnL bruto: R$ %.4f | Taxas: R$ %.4f | PnL líquido: R$ %.4f",

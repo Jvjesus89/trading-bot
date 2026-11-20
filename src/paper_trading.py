@@ -15,9 +15,11 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
-# Configuração de retry para chamadas de dados de mercado
-_OHLCV_MAX_RETRIES = 3
-_OHLCV_RETRY_DELAY = 2.0  # segundos (dobra a cada tentativa: 2s, 4s)
+# Configuração de retry para chamadas de dados de mercado.
+# ccxt.NetworkError inclui falhas de DNS (ClientConnectorDNSError), que antes
+# não eram reprocessadas e deixavam o robô cego até o próximo ciclo.
+_FETCH_MAX_RETRIES = 3
+_FETCH_RETRY_DELAY = 2.0  # segundos (dobra a cada tentativa: 2s, 4s)
 
 
 class PaperTradingClient:
@@ -41,9 +43,14 @@ class PaperTradingClient:
         """Conecta à Binance em modo somente leitura (sem API keys)."""
         self._exchange = ccxt.binance({
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
+            "options": {
+                "defaultType": "spot",
+                "fetchMarkets": ["spot"],
+            },
         })
-        await self._exchange.load_markets()
+        await self._fetch_with_retry(
+            lambda: self._exchange.load_markets(), "load_markets"
+        )
         symbol = config.trading.symbol
         if symbol in self._exchange.markets:
             self._market_info = self._exchange.markets[symbol]
@@ -61,40 +68,49 @@ class PaperTradingClient:
     # Dados de mercado (passthrough para Binance real)
     # ------------------------------------------------------------------
 
-    async def _fetch_ohlcv_raw(self, symbol: str, timeframe: str, limit: int) -> list:
-        """Chamada direta ao CCXT, sem retry."""
-        return await self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-
-    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 250) -> list:
+    async def _fetch_with_retry(self, factory, label: str):
         """
-        Busca candles OHLCV com retry automático em caso de timeout.
-        Tenta até _OHLCV_MAX_RETRIES vezes com backoff exponencial.
+        Executa uma chamada de dados de mercado com backoff exponencial.
+        Reprocessa ccxt.NetworkError (inclui DNS e timeout) até 3 vezes.
         """
         last_exc: Optional[Exception] = None
-        for attempt in range(1, _OHLCV_MAX_RETRIES + 1):
+        for attempt in range(1, _FETCH_MAX_RETRIES + 1):
             try:
-                return await self._fetch_ohlcv_raw(symbol, timeframe, limit)
+                return await factory()
             except (ccxt.RequestTimeout, ccxt.NetworkError) as exc:
                 last_exc = exc
-                if attempt < _OHLCV_MAX_RETRIES:
-                    wait = _OHLCV_RETRY_DELAY * (2 ** (attempt - 1))
+                if attempt < _FETCH_MAX_RETRIES:
+                    wait = _FETCH_RETRY_DELAY * (2 ** (attempt - 1))
                     logger.warning(
-                        "[PAPER] fetch_ohlcv timeout (tentativa %d/%d). Retry em %.0fs: %s",
-                        attempt, _OHLCV_MAX_RETRIES, wait, exc,
+                        "[PAPER] %s falhou (tentativa %d/%d). Retry em %.0fs: %s",
+                        label, attempt, _FETCH_MAX_RETRIES, wait, exc,
                     )
                     await asyncio.sleep(wait)
                 else:
                     logger.error(
-                        "[PAPER] fetch_ohlcv falhou após %d tentativas: %s",
-                        _OHLCV_MAX_RETRIES, exc,
+                        "[PAPER] %s falhou após %d tentativas: %s",
+                        label, _FETCH_MAX_RETRIES, exc,
                     )
         raise last_exc  # propaga após esgotar tentativas
 
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 250) -> list:
+        """Busca candles OHLCV com retry automático (DNS/timeout)."""
+        return await self._fetch_with_retry(
+            lambda: self._exchange.fetch_ohlcv(symbol, timeframe, limit=limit),
+            f"fetch_ohlcv({symbol},{timeframe})",
+        )
+
     async def fetch_ticker(self, symbol: str) -> dict:
-        return await self._exchange.fetch_ticker(symbol)
+        return await self._fetch_with_retry(
+            lambda: self._exchange.fetch_ticker(symbol),
+            f"fetch_ticker({symbol})",
+        )
 
     async def fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
-        return await self._exchange.fetch_order_book(symbol, limit=limit)
+        return await self._fetch_with_retry(
+            lambda: self._exchange.fetch_order_book(symbol, limit=limit),
+            f"fetch_order_book({symbol})",
+        )
 
     async def fetch_balance(self) -> dict:
         """Retorna o saldo simulado."""
@@ -136,7 +152,7 @@ class PaperTradingClient:
     async def create_market_buy(self, symbol: str, amount: float) -> dict:
         """Simula uma compra a mercado usando o preço ask do ticker."""
         amount = self.amount_to_precision(symbol, amount)
-        ticker = await self._exchange.fetch_ticker(symbol)
+        ticker = await self.fetch_ticker(symbol)
         price = ticker.get("ask", ticker.get("last", 0))
 
         cost = amount * price
@@ -176,7 +192,7 @@ class PaperTradingClient:
     async def create_market_sell(self, symbol: str, amount: float) -> dict:
         """Simula uma venda a mercado usando o preço bid do ticker."""
         amount = self.amount_to_precision(symbol, amount)
-        ticker = await self._exchange.fetch_ticker(symbol)
+        ticker = await self.fetch_ticker(symbol)
         price = ticker.get("bid", ticker.get("last", 0))
 
         revenue = amount * price

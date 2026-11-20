@@ -5,8 +5,12 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # DNS explícito: o resolver interno do Docker pode falhar (VPN/firewall do
+    # host) e derrubar api.binance.com com "Temporary failure in name resolution".
+    # Google primário/secundário + Cloudflare como terceiro fallback.
     dns:
       - 8.8.8.8
+      - 8.8.4.4
       - 1.1.1.1
     volumes:
       - ./logs:/app/logs
@@ -31,8 +35,11 @@ services:
     restart: unless-stopped
     ports:
       - "3000:3000"
+    env_file:
+      - .env
     dns:
       - 8.8.8.8
+      - 8.8.4.4
       - 1.1.1.1
     volumes:
       - ./logs:/app/logs:ro

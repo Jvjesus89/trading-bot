@@ -34,21 +34,34 @@ class ExecutionIndicators:
     atr: float                    # ATR (14)
     rvol: float                   # Volume Relativo (Volume / SMA Volume 20)
     current_close: float          # Preço de fechamento do último candle 5m
+    current_open: float           # Preço de abertura do último candle 5m
+    current_high: float           # Máxima do último candle 5m
+    current_low: float            # Mínima do último candle 5m
     current_volume: float         # Volume do último candle 5m
 
     @property
+    def is_green_candle(self) -> bool:
+        """Indica se o candle atual é de alta (compradores dominando o candle)."""
+        return self.current_close > self.current_open
+
+    @property
     def price_at_or_below_bb_lower(self) -> bool:
-        """Preço tocou ou rompeu a Banda Inferior."""
+        """Preço de fechamento tocou ou rompeu a Banda Inferior."""
         return self.current_close <= self.bb_lower
 
     @property
+    def price_tested_bb_lower(self) -> bool:
+        """A mínima do candle testou a Banda Inferior ou o preço atual está nela."""
+        return self.current_low <= self.bb_lower or self.current_close <= (self.bb_lower * 1.002)
+
+    @property
     def rsi_oversold(self) -> bool:
-        """RSI abaixo do limiar de sobrevenda (32)."""
+        """RSI abaixo do limiar de sobrevenda (configurável, default 32)."""
         return self.rsi < config.trading.rsi_threshold
 
     @property
     def volume_confirmed(self) -> bool:
-        """Volume relativo acima do limiar (1.0)."""
+        """Volume relativo acima do limiar (configurável, default 1.0)."""
         return self.rvol > config.trading.rvol_threshold
 
 
@@ -163,6 +176,9 @@ def calculate_execution_indicators(ohlcv_5m: list) -> Optional[ExecutionIndicato
         return None
 
     df = _to_dataframe(ohlcv_5m)
+    open_series = df["open"]
+    high_series = df["high"]
+    low_series = df["low"]
     close = df["close"]
     volume = df["volume"]
 
@@ -188,5 +204,8 @@ def calculate_execution_indicators(ohlcv_5m: list) -> Optional[ExecutionIndicato
         atr=float(atr_series.iloc[-1]),
         rvol=float(rvol_series.iloc[-1]) if not pd.isna(rvol_series.iloc[-1]) else 0.0,
         current_close=float(close.iloc[-1]),
+        current_open=float(open_series.iloc[-1]),
+        current_high=float(high_series.iloc[-1]),
+        current_low=float(low_series.iloc[-1]),
         current_volume=float(volume.iloc[-1]),
     )

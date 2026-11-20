@@ -23,10 +23,11 @@ export default function Dashboard() {
       banca_atual: 100.0,
     },
     ia: {
-      autorizado: true,
-      nivel_risco: "BAIXO",
-      motivo: "Aguardando leitura de contexto...",
+      autorizado: false,
+      nivel_risco: "ALTO",
+      motivo: "Aguardando o primeiro setup técnico para auditar uma entrada.",
       timestamp: 0,
+      fonte: "pending",
     },
     position: null,
     indicators: {
@@ -43,7 +44,7 @@ export default function Dashboard() {
       bb_lower_touch: false,
       rsi_oversold: false,
       rvol_confirmed: false,
-      ia_authorized: true,
+      ia_authorized: false,
     },
   });
 
@@ -141,7 +142,7 @@ export default function Dashboard() {
         currentPrice={currentPrice}
       />
 
-      {/* 3. Card de Auditoria Macro de IA (Gemini Flash) */}
+      {/* 3. Card de Auditoria de Entrada (DeepSeek) */}
       <AIAdvisorCard ia={status.ia} />
 
       {/* 4. Radar dos 5 Gatilhos de Entrada */}
@@ -149,6 +150,7 @@ export default function Dashboard() {
         signals={status.signals}
         indicators={status.indicators}
         currentPrice={currentPrice}
+        iaDisabled={["disabled", "missing_key"].includes(status.ia?.fonte)}
       />
 
       {/* 5. Terminal Gráfico de Candlesticks + Bollinger + RSI */}

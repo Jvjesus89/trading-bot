@@ -34,15 +34,36 @@ class TradingConfig:
     rsi_period: int = 14         # RSI (5m)
     atr_period: int = 14         # ATR (5m)
     rvol_period: int = 20        # Volume Relativo (5m)
-    rsi_threshold: float = 32.0  # RSI abaixo de 32 = sobrevenda
-    rvol_threshold: float = 1.0  # RVOL acima de 1.0 = liquidez confirmada
+    rsi_threshold: float = float(os.getenv("RSI_THRESHOLD", "32.0"))  # Sobrevenda normal (<32)
+    rsi_reversal_threshold: float = float(os.getenv("RSI_REVERSAL_THRESHOLD", "30.0"))  # Exaustão (<30)
+    rvol_threshold: float = float(os.getenv("RVOL_THRESHOLD", "1.0"))  # Liquidez confirmada
 
-    # Gestão de saída dinâmica (multiplicadores ATR)
-    sl_atr_mult: float = 1.5     # Stop Loss = Entrada - 1.5 * ATR
-    tp_atr_mult: float = 2.0     # Take Profit = Entrada + 2.0 * ATR
-    be_atr_mult: float = 1.0     # Breakeven ativa quando lucro >= 1.0 * ATR
-    be_fee_offset: float = 0.0015  # 0.15% para cobrir taxas no breakeven
-    trailing_atr_mult: float = 1.0  # Trailing stop segue com distância de 1.0 * ATR
+    # Anti-faca caindo: exige que o candle de 5m seja verde (close > open) para confirmar reação compradora
+    require_green_candle: bool = os.getenv("REQUIRE_GREEN_CANDLE", "true").lower() in ("true", "1", "yes")
+
+    # Flexibilização opcional de teste para PAPER trading
+    paper_ignore_ema200: bool = os.getenv("PAPER_IGNORE_EMA200", "false").lower() in ("true", "1", "yes")
+
+    # Permite entrada por "reversão de fundo" (RSI de exaustão + candle verde)
+    # MESMO com preço abaixo da EMA200. Com "false" o bot só compra dip em
+    # tendência de alta — filtro de regime testado no backtest.
+    # Default true = comportamento histórico (não muda produção).
+    allow_below_ema_reversal: bool = os.getenv("ALLOW_BELOW_EMA_REVERSAL", "true").lower() in ("true", "1", "yes")
+
+    # Validação de IA (Auditor DeepSeek) por entrada. Com "true" cada compra
+    # aprovada pelos 4 filtros técnicos passa por uma auditoria antes da ordem.
+    # Sem a chave configurada o PAPER segue sem auditoria (fail-open explícito),
+    # mas o LIVE bloqueia — nunca opera dinheiro real sem auditor.
+    ai_validation_enabled: bool = os.getenv("AI_VALIDATION_ENABLED", "false").lower() in ("true", "1", "yes")
+
+    # Gestão de saída dinâmica (multiplicadores ATR com piso percentual para evitar ruído de spread)
+    sl_atr_mult: float = float(os.getenv("SL_ATR_MULT", "2.0"))     # Stop Loss = Entrada - 2.0 * ATR
+    sl_min_pct: float = float(os.getenv("SL_MIN_PCT", "1.5")) / 100.0  # Stop Loss Mínimo = 1.5% (protege contra spread)
+    tp_atr_mult: float = float(os.getenv("TP_ATR_MULT", "2.5"))     # Take Profit = Entrada + 2.5 * ATR
+    tp_min_pct: float = float(os.getenv("TP_MIN_PCT", "2.5")) / 100.0  # Take Profit Mínimo = 2.5% (assimetria TP>SL)
+    be_atr_mult: float = float(os.getenv("BE_ATR_MULT", "1.0"))     # Breakeven ativa quando lucro >= 1.0 * ATR
+    be_fee_offset: float = 0.0020  # 0.20% para cobrir taxas completas de compra e venda
+    trailing_atr_mult: float = float(os.getenv("TRAILING_ATR_MULT", "1.2"))  # Trailing stop segue com distância de 1.2 * ATR
 
     # Slippage
     slippage_max: float = 0.003  # 0.3% — alerta de HIGH_SLIPPAGE
@@ -61,16 +82,21 @@ class ExchangeConfig:
     api_secret: str = os.getenv("BINANCE_API_SECRET", "")
     options: dict = field(default_factory=lambda: {
         "defaultType": "spot",
+        "fetchMarkets": ["spot"],
         "adjustForTimeDifference": True,
         "recvWindow": 10000,
     })
 
 
 @dataclass(frozen=True)
-class GeminiConfig:
-    """Configurações da integração com Gemini Flash."""
-    api_key: str = os.getenv("GEMINI_API_KEY", "")
-    model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+class DeepSeekConfig:
+    """Configurações do auditor de entrada DeepSeek."""
+    api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
+    model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    api_url: str = os.getenv(
+        "DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions"
+    )
+    timeout: float = float(os.getenv("DEEPSEEK_TIMEOUT", "15"))
 
 
 @dataclass(frozen=True)
@@ -79,7 +105,6 @@ class SupabaseConfig:
     url: str = os.getenv("SUPABASE_URL", "")
     key: str = os.getenv("SUPABASE_KEY", "")
     schema: str = os.getenv("SUPABASE_SCHEMA", "trading_bot")
-
 
 
 @dataclass(frozen=True)
@@ -98,7 +123,7 @@ class HealthcheckConfig:
 # Instâncias globais de configuração
 trading = TradingConfig()
 exchange = ExchangeConfig()
-gemini = GeminiConfig()
+deepseek = DeepSeekConfig()
 supabase = SupabaseConfig()
 telegram = TelegramConfig()
 healthcheck = HealthcheckConfig()

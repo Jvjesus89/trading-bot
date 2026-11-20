@@ -41,8 +41,10 @@ class ExchangeClient:
             "enableRateLimit": True,
             "options": cfg.options,
         })
-        # Carrega informações de mercado para validação de lote
-        await self._exchange.load_markets()
+        # Carrega informações de mercado para validação de lote.
+        # Passa pelo _retry: uma falha transitória de DNS no boot não deve
+        # derrubar o processo (o container reiniciaria em loop).
+        await self._retry(lambda: self._exchange.load_markets(), "load_markets")
         symbol = config.trading.symbol
         if symbol in self._exchange.markets:
             self._market_info = self._exchange.markets[symbol]
@@ -70,7 +72,9 @@ class ExchangeClient:
         for attempt in range(self._max_retries):
             try:
                 return await coro_factory()
-            except (ccxt.RateLimitExceeded, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:
+            # ccxt.NetworkError cobre DNS ("Temporary failure in name resolution"),
+            # timeout, 5xx e indisponibilidade — antes o DNS estourava sem retry.
+            except (ccxt.RateLimitExceeded, ccxt.NetworkError) as e:
                 delay = self._base_delay * (2 ** attempt)
                 logger.warning(
                     "[%s] Tentativa %d/%d falhou: %s | Retry em %.1fs",
